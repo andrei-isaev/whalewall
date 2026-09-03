@@ -106,22 +106,30 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 		return fmt.Errorf("container %q has no configuration", contName)
 	}
 
-	// Collect the container's IPv4 addresses before changing nftables.
-	addrs := make(map[string][]byte, len(container.NetworkSettings.Networks))
-	var ipv6Networks []string
-	for netName, netSettings := range container.NetworkSettings.Networks {
-		if netSettings.GlobalIPv6Address.IsValid() {
-			ipv6Networks = append(ipv6Networks, netName)
+	// Resolve the network scope before changing nftables. A valid explicit
+	// scope selects only those endpoint addresses. If the label itself is
+	// malformed or unresolved, fall back to every attached endpoint so the
+	// error cannot turn enforcement into an empty (fail-open) address map.
+	project := container.Config.Labels[composeProjectLabel]
+	policyNetworks, explicitScope, scopeErr := resolveManagedNetworks(
+		container.Config.Labels,
+		project,
+		container.NetworkSettings.Networks,
+	)
+	if scopeErr == nil && explicitScope {
+		scopeErr = validateScopedAddressUniqueness(policyNetworks, container.NetworkSettings.Networks)
+		if scopeErr == nil {
+			_, scopeErr = collectManagedIPv4Addresses(policyNetworks)
 		}
-		addr := netSettings.IPAddress
-		if !addr.IsValid() {
-			return fmt.Errorf("container %q has an invalid IP address on network %q", contName, netName)
-		}
-		if !addr.Is4() {
-			return fmt.Errorf("unsupported IP address %q on network %q: Whalewall supports IPv4 only", addr, netName)
-		}
-		addrs[netName] = ref(addr.As4())[:]
 	}
+	if scopeErr != nil {
+		policyNetworks = cloneNetworks(container.NetworkSettings.Networks)
+	}
+	addrs, addressErr := collectManagedIPv4Addresses(policyNetworks)
+	if len(policyNetworks) == 0 {
+		addressErr = errors.Join(addressErr, errors.New("container has no managed network endpoints"))
+	}
+	networkPolicyErr := errors.Join(scopeErr, addressErr)
 
 	// Rules generated for this source can be installed in peer-container
 	// chains. Keep dependency snapshots, nftables changes, and rollback ordered
@@ -186,8 +194,8 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 	if err := r.reconcileContainerMetadata(ctx, nfc, container.ID, contName, service, chain.Name, addrs); err != nil {
 		return fmt.Errorf("error persisting fail-closed container metadata: %w", err)
 	}
-	if len(ipv6Networks) != 0 {
-		return fmt.Errorf("container is attached to IPv6-enabled networks %q; Whalewall supports IPv4 only", ipv6Networks)
+	if networkPolicyErr != nil {
+		return fmt.Errorf("invalid managed network scope: %w", networkPolicyErr)
 	}
 
 	// Parse configuration only after the enforcement floor is active. Invalid
@@ -201,7 +209,9 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 		if err := dec.Decode(&rulesCfg); err != nil {
 			return fmt.Errorf("error parsing rules: %w", err)
 		}
-		if err := validateConfig(rulesCfg); err != nil {
+		var err error
+		rulesCfg, err = normalizeConfig(rulesCfg)
+		if err != nil {
 			return fmt.Errorf("error validating rules: %w", err)
 		}
 	}
@@ -218,10 +228,9 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 		return err
 	}
 
-	project := container.Config.Labels[composeProjectLabel]
 	estContainers := make(map[string]struct{})
 	if configExists {
-		if err := r.populateOutputRules(ctx, tx, rulesCfg, container.ID, project, container.NetworkSettings.Networks, estContainers); err != nil {
+		if err := r.populateOutputRules(ctx, tx, rulesCfg, container.ID, project, policyNetworks, estContainers); err != nil {
 			return fmt.Errorf("error validating rules: %w", err)
 		}
 	}
@@ -230,7 +239,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 	// create rules that allow traffic from another container to this
 	// container if necessary that couldn't be created before
 	logger.Debug("creating waiting rules")
-	waitingRules, err := r.createWaitingContainerRules(ctx, nfc, logger, tx, container.ID, contName, service, project, container.NetworkSettings.Networks, chain, estContainers)
+	waitingRules, err := r.createWaitingContainerRules(ctx, nfc, logger, tx, container.ID, contName, service, project, policyNetworks, chain, estContainers)
 	if err != nil {
 		return fmt.Errorf("error creating waiting output rules: %w", err)
 	}
@@ -249,7 +258,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 
 		// handle port mapping rules
 		logger.Debug("creating mapped port rules")
-		portMapRules, err := r.createPortMappingRules(nfc, logger, container, contName, rulesCfg.MappedPorts, addrs, chain)
+		portMapRules, err := r.createPortMappingRules(nfc, logger, container, contName, rulesCfg.MappedPorts, policyNetworks, addrs, chain, explicitScope)
 		if err != nil {
 			return fmt.Errorf("error creating port mapping rules: %w", err)
 		}
@@ -275,7 +284,13 @@ func (r *RuleManager) reconcileContainerMetadata(ctx context.Context, nfc firewa
 	defer r.addressMapMu.Unlock()
 
 	desired := make([]nftables.SetElement, 0, len(addrs))
+	seenAddresses := make(map[string]struct{}, len(addrs))
 	for _, addr := range addrs {
+		key := string(addr)
+		if _, duplicate := seenAddresses[key]; duplicate {
+			continue
+		}
+		seenAddresses[key] = struct{}{}
 		desired = append(desired, nftables.SetElement{
 			Key: addr,
 			VerdictData: &expr.Verdict{
@@ -444,10 +459,16 @@ func replaceContainerAddressMappings(nfc firewallClient, desired []nftables.SetE
 			deleteElements = append(deleteElements, nftables.SetElement{Key: existing.Key})
 		}
 	}
+	queuedDesired := make(map[string]struct{}, len(desired))
 	for _, desiredElement := range desired {
-		if _, ok := seenDesired[string(desiredElement.Key)]; ok {
+		key := string(desiredElement.Key)
+		if _, ok := seenDesired[key]; ok {
 			continue
 		}
+		if _, duplicate := queuedDesired[key]; duplicate {
+			continue
+		}
+		queuedDesired[key] = struct{}{}
 		addElements = append(addElements, desiredElement)
 	}
 	if len(deleteElements) == 0 && len(addElements) == 0 {
@@ -677,20 +698,20 @@ func stripName(name string) string {
 // populateOutputRules attempts to find the IPs of containers specified
 // in output rules and fills the rules appropriately.
 func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, cfg config, id, project string, networks map[string]*network.EndpointSettings, estConts map[string]struct{}) error {
-	// only get a list of containers if at least one rule specifies a
-	// container
-	i := slices.IndexFunc(cfg.Output, func(r ruleConfig) bool {
+	hasContainerRule := slices.IndexFunc(cfg.Output, func(r ruleConfig) bool {
 		return r.Container != ""
-	})
-	if i == -1 {
-		return nil
-	}
-	listedConts, err := r.dockerCli.ContainerList(ctx, client.ContainerListOptions{})
-	if err != nil {
-		return fmt.Errorf("error listing running containers: %w", err)
+	}) != -1
+	var listedConts []dockercontainer.Summary
+	if hasContainerRule {
+		result, err := r.dockerCli.ContainerList(ctx, client.ContainerListOptions{})
+		if err != nil {
+			return fmt.Errorf("error listing running containers: %w", err)
+		}
+		listedConts = result
 	}
 
 	containers := make(map[string]dockercontainer.InspectResponse)
+	containerNetworks := make(map[string]map[string]*network.EndpointSettings)
 	for i, ruleCfg := range cfg.Output {
 		// ensure the specified network exists
 		var srcNetName string
@@ -722,20 +743,35 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 				rank      int
 			}
 			var candidates []candidate
-			nameMatches := 0
+			bestNameRank := 0
+			var bestNameMatches []dockercontainer.Summary
 			for _, listedCont := range listedConts {
 				rank := containerNameMatchRank(ruleCfg.Container, project, listedCont.Labels, listedCont.Names...)
-				if rank == 0 {
+				if rank == 0 || rank < bestNameRank {
 					continue
 				}
-				nameMatches++
-
+				if rank > bestNameRank {
+					bestNameRank = rank
+					bestNameMatches = bestNameMatches[:0]
+				}
+				bestNameMatches = append(bestNameMatches, listedCont)
+			}
+			nameMatches := len(bestNameMatches)
+			unmanagedNetworkMatches := 0
+			for _, listedCont := range bestNameMatches {
 				// validate container settings
 				cont, ok := containers[listedCont.ID]
 				if !ok {
-					cont, err = r.dockerCli.ContainerInspect(ctx, listedCont.ID)
-					if err != nil {
-						return fmt.Errorf("error inspecting container %s: %w", listedCont.ID[:12], err)
+					inspected, inspectErr := r.dockerCli.ContainerInspect(ctx, listedCont.ID)
+					if inspectErr != nil {
+						return fmt.Errorf("error inspecting container %s: %w", listedCont.ID[:12], inspectErr)
+					}
+					cont = inspected
+					if cont.Config == nil {
+						return fmt.Errorf("output rule #%d: container %q has no configuration", i, ruleCfg.Container)
+					}
+					if cont.NetworkSettings == nil {
+						return fmt.Errorf("output rule #%d: container %q has no network settings", i, ruleCfg.Container)
 					}
 					enabled, err := whalewallEnabled(cont.Config.Labels)
 					if err != nil {
@@ -747,21 +783,37 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 							ruleCfg.Container,
 						)
 					}
+					dstProject := cont.Config.Labels[composeProjectLabel]
+					managed, _, err := resolveValidManagedNetworks(cont.Config.Labels, dstProject, cont.NetworkSettings.Networks)
+					if err != nil {
+						return fmt.Errorf("output rule #%d: container %q has invalid managed network scope: %w", i, ruleCfg.Container, err)
+					}
 					containers[listedCont.ID] = cont
+					containerNetworks[listedCont.ID] = managed
 				}
 				dstProject := cont.Config.Labels[composeProjectLabel]
-				dstNetName, dstNetwork, ok := findNetwork(ruleCfg.Network, dstProject, cont.NetworkSettings.Networks)
+				if _, _, attached := findNetwork(ruleCfg.Network, dstProject, cont.NetworkSettings.Networks); !attached {
+					continue
+				}
+				dstNetName, dstNetwork, ok := findNetwork(ruleCfg.Network, dstProject, containerNetworks[listedCont.ID])
 				if !ok {
+					unmanagedNetworkMatches++
 					continue
 				}
 				if !sameDockerNetwork(srcNetName, srcNetwork, dstNetName, dstNetwork) {
 					continue
 				}
-				candidates = append(candidates, candidate{container: cont, network: dstNetwork, netName: dstNetName, rank: rank})
+				candidates = append(candidates, candidate{container: cont, network: dstNetwork, netName: dstNetName, rank: bestNameRank})
 			}
 
+			if len(candidates) == 0 && unmanagedNetworkMatches != 0 {
+				return fmt.Errorf("output rule #%d: container %q does not manage Docker network %q", i, ruleCfg.Container, ruleCfg.Network)
+			}
 			if len(candidates) == 0 && nameMatches != 0 {
 				return fmt.Errorf("output rule #%d: container %q does not share Docker network %q with the source container", i, ruleCfg.Container, ruleCfg.Network)
+			}
+			if len(candidates) == 0 && ruleCfg.fromContainerList {
+				return fmt.Errorf("output rule #%d: listed container %q could not be resolved", i, ruleCfg.Container)
 			}
 			if len(candidates) != 0 {
 				bestRank := slices.MaxFunc(candidates, func(a, b candidate) int { return cmp.Compare(a.rank, b.rank) }).rank
@@ -885,7 +937,7 @@ func buildChainName(_ string, id string) string {
 // TODO: avoid creating almost duplicate rules as output rules
 // createPortMappingRules adds nftables rules to allow or deny access to
 // mapped ports.
-func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Logger, container dockercontainer.InspectResponse, contName string, mappedPortsCfg mappedPorts, addrs map[string][]byte, chain *nftables.Chain) ([]*nftables.Rule, error) {
+func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Logger, container dockercontainer.InspectResponse, contName string, mappedPortsCfg mappedPorts, managedNetworks map[string]*network.EndpointSettings, addrs map[string][]byte, chain *nftables.Chain, explicitScope bool) ([]*nftables.Rule, error) {
 	// check if there are any mapped ports to create rules for
 	var hasMappedPorts bool
 	for _, hostPorts := range container.NetworkSettings.Ports {
@@ -912,13 +964,19 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 		mappedPortsCfg.External.LogPrefix = formatLogPrefix(mappedPortsCfg.External.LogPrefix, contName, container.ID)
 	}
 
-	nftRules := make([]*nftables.Rule, 0, len(container.NetworkSettings.Networks))
-	for netName, netSettings := range container.NetworkSettings.Networks {
+	nftRules := make([]*nftables.Rule, 0, len(managedNetworks))
+	managedNetworkNames := slices.Collect(maps.Keys(managedNetworks))
+	slices.Sort(managedNetworkNames)
+	for _, netName := range managedNetworkNames {
+		netSettings := managedNetworks[netName]
 		var gateway netip.Addr
 		if netSettings.Gateway.IsValid() {
 			gateway = netSettings.Gateway
 		} else if mappedPortsCfg.Localhost.Allow {
 			logger.Warn("localhost mapped-port access cannot be enabled on a network without a gateway", zap.String("network.name", netName))
+		}
+		if explicitScope && mappedPortsCfg.External.Allow && !mappedPortsCfg.Localhost.Allow && !gateway.IsValid() {
+			return nil, fmt.Errorf("network %q has no gateway, so scoped mapped-port policy cannot deny localhost while allowing external traffic", netName)
 		}
 
 		// sort mapped ports so rules are created deterministically making
@@ -1001,7 +1059,7 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 					nftRules = append(nftRules, rules...)
 				}
 
-				if !localAllowed {
+				if !localAllowed && !explicitScope {
 					// Create rule to drop traffic going to the mapped
 					// host port. This will prevent traffic originating
 					// from localhost to be seen by Docker at all.
@@ -1131,7 +1189,10 @@ func (r *RuleManager) createOutputRules(ctx context.Context, nfc firewallClient,
 			}
 			nftRules = append(nftRules, rules...)
 		} else {
-			for _, addr := range addrs {
+			networkNames := slices.Collect(maps.Keys(addrs))
+			slices.Sort(networkNames)
+			for _, networkName := range networkNames {
+				addr := addrs[networkName]
 				rule.addr = addr
 				rules, err := createNFTRules(nfc, logger, rule)
 				if err != nil {
@@ -1231,8 +1292,8 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		// filtered by canonical network identity without quarantining it.
 		dstNetName, dstNetwork, ok := findNetwork(ruleCfg.Network, project, networks)
 		if !ok {
-			if exactDestination {
-				return nil, fmt.Errorf("network %q not found", ruleCfg.Network)
+			if exactDestination || ruleCfg.SourceProject == project {
+				return nil, fmt.Errorf("destination container %q does not manage Docker network %q", name, ruleCfg.Network)
 			}
 			continue
 		}
@@ -1248,16 +1309,26 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		if err != nil {
 			return nil, fmt.Errorf("error inspecting container %q: %w", waitingRule.Name, err)
 		}
+		if srcCont.Config == nil {
+			return nil, fmt.Errorf("source container %q has no configuration", waitingRule.Name)
+		}
+		if srcCont.NetworkSettings == nil {
+			return nil, fmt.Errorf("source container %q has no network settings", waitingRule.Name)
+		}
 		enabled, err := whalewallEnabled(srcCont.Config.Labels)
 		if err != nil || !enabled {
 			return nil, fmt.Errorf("source container %q no longer has a valid enabled Whalewall policy", waitingRule.Name)
 		}
 		srcProject := srcCont.Config.Labels[composeProjectLabel]
-		srcNetName, srcNetwork, ok := findNetwork(ruleCfg.Network, srcProject, srcCont.NetworkSettings.Networks)
+		srcManagedNetworks, _, err := resolveValidManagedNetworks(srcCont.Config.Labels, srcProject, srcCont.NetworkSettings.Networks)
+		if err != nil {
+			return nil, fmt.Errorf("source container %q has invalid managed network scope: %w", waitingRule.Name, err)
+		}
+		srcNetName, srcNetwork, ok := findNetwork(ruleCfg.Network, srcProject, srcManagedNetworks)
 		if !ok {
-			return nil, fmt.Errorf("network %q not found for container %q",
+			return nil, fmt.Errorf("managed network %q not found for container %q",
 				ruleCfg.Network,
-				ruleCfg.Container,
+				waitingRule.Name,
 			)
 		}
 		srcAddr := srcNetwork.IPAddress

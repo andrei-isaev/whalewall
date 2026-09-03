@@ -52,21 +52,23 @@ func TestIntegration(t *testing.T) {
 
 	checkFirewallRules := func() {
 		requireWhalewallRunning(t, whalewall)
-		is.True(runClientCmd(t, "nslookup google.com") == 0)                             // udp port 53 is allowed
-		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed
-		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is not allowed
-		is.True(runClientCmd(t, "curl --connect-timeout 1 https://www.google.com") == 0) // DNS and HTTPS is allowed externally
-		is.True(tcpPortOpen(t, "client", "server", 756))                                 // tcp port 756 is allowed client -> server
-		is.True(!udpPortOpen(t, "client", "server", 756, "server", 756))                 // udp port 756 is not allowed client -> server
-		is.True(udpPortOpen(t, "client", "server", 757, "server", 757))                  // udp port 757 is allowed client -> server
-		is.True(!tcpPortOpen(t, "client", "server", 80))                                 // tcp port 80 is not allowed client -> server
-		is.True(!udpPortOpen(t, "client", "server", 80, "server", 80))                   // udp port 80 is not allowed client -> server
-		is.True(tcpPortOpen(t, "tester", "localhost", 8080))                             // tcp mapped port 8080:80 of client is allowed from localhost
-		is.True(udpPortOpen(t, "tester", "localhost", 8080, "client", 80))               // udp mapped port 8080:80 of client is allowed from localhost
-		is.True(!tcpPortOpen(t, "tester", "localhost", 8081))                            // tcp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!udpPortOpen(t, "tester", "localhost", 8081, "server", 80))              // udp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!tcpPortOpen(t, "tester", "localhost", 9001))                            // tcp mapped port 9001:9001 of server is not allowed from localhost
-		is.True(!udpPortOpen(t, "tester", "localhost", 9001, "server", 9001))            // udp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(runClientCmd(t, "nslookup google.com") == 0)                                                      // udp port 53 is allowed
+		is.True(runClientCmd(t, "curl --interface 172.29.203.2 --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed on the managed network
+		is.True(runClientCmd(t, "curl --interface 172.29.203.2 --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is denied on the managed network
+		is.True(runClientCmd(t, "curl --interface 172.29.203.2 --connect-timeout 1 https://www.google.com") == 0) // HTTPS is allowed on the managed network
+		is.True(tcpPortOpen(t, "client", "172.29.203.3", 756))                                                    // tcp port 756 is allowed on managed network
+		is.True(!udpPortOpen(t, "client", "172.29.203.3", 756, "server", 756))                                    // udp port 756 is denied on managed network
+		is.True(udpPortOpen(t, "client", "172.29.203.3", 757, "server", 757))                                     // udp port 757 is allowed on managed network
+		is.True(!tcpPortOpen(t, "client", "172.29.203.3", 80))                                                    // tcp port 80 is denied on managed network
+		is.True(!udpPortOpen(t, "client", "172.29.203.3", 80, "server", 80))                                      // udp port 80 is denied on managed network
+		is.True(tcpPortOpen(t, "client", "172.29.204.3", 80))                                                     // unselected network remains unaffected
+		is.True(udpPortOpen(t, "client", "172.29.204.3", 80, "server", 80))                                       // unselected UDP remains unaffected
+		is.True(tcpPortOpen(t, "tester", "localhost", 8080))                                                      // tcp mapped port 8080:80 of client is allowed from localhost
+		is.True(udpPortOpen(t, "tester", "localhost", 8080, "client", 80))                                        // udp mapped port 8080:80 of client is allowed from localhost
+		is.True(!tcpPortOpen(t, "tester", "localhost", 8081))                                                     // tcp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!udpPortOpen(t, "tester", "localhost", 8081, "server", 80))                                       // udp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!tcpPortOpen(t, "tester", "localhost", 9001))                                                     // tcp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(!udpPortOpen(t, "tester", "localhost", 9001, "server", 9001))                                     // udp mapped port 9001:9001 of server is not allowed from localhost
 	}
 
 	tempDir := t.TempDir()
@@ -142,13 +144,13 @@ func TestIntegration(t *testing.T) {
 		Table: filterTable,
 	}
 	var serverAddr netip.Addr
-	// Compose derives the network name from the project/directory, so discover
-	// the sole bridge endpoint instead of relying on a runner-specific name.
-	for _, endpoint := range server.NetworkSettings.Networks {
-		if endpoint != nil && endpoint.IPAddress.IsValid() {
-			serverAddr = endpoint.IPAddress
-			break
-		}
+	// Compose derives the network name from the project/directory. Resolve the
+	// explicitly managed default endpoint rather than selecting the additional
+	// unselected monitoring endpoint by map iteration order.
+	project := server.Config.Labels[composeProjectLabel]
+	_, serverEndpoint, ok := findNetwork("default", project, server.NetworkSettings.Networks)
+	if ok && serverEndpoint != nil {
+		serverAddr = serverEndpoint.IPAddress
 	}
 	if !serverAddr.Is4() {
 		t.Fatalf("replacement server has no valid IPv4 endpoint: %+v", server.NetworkSettings.Networks)
@@ -384,15 +386,17 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 		if item.container.NetworkSettings == nil {
 			return fmt.Errorf("container %q has no network settings", item.name)
 		}
-		var address netip.Addr
-		for _, endpoint := range item.container.NetworkSettings.Networks {
-			if endpoint != nil && endpoint.IPAddress.Is4() {
-				address = endpoint.IPAddress
-				break
-			}
+		project := item.container.Config.Labels[composeProjectLabel]
+		managed, explicit, err := resolveValidManagedNetworks(item.container.Config.Labels, project, item.container.NetworkSettings.Networks)
+		if err != nil {
+			return fmt.Errorf("resolve container %q managed networks: %w", item.name, err)
 		}
-		if !address.Is4() {
-			return fmt.Errorf("container %q has no IPv4 address", item.name)
+		if !explicit || len(managed) != 1 {
+			return fmt.Errorf("container %q managed networks = %#v, explicit=%t; want one explicit endpoint", item.name, managed, explicit)
+		}
+		var address netip.Addr
+		for _, endpoint := range managed {
+			address = endpoint.IPAddress
 		}
 		policies = append(policies, expectedPolicy{
 			name:      item.name,
@@ -416,6 +420,9 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 	elements, err := nfc.GetSetElements(set)
 	if err != nil {
 		return fmt.Errorf("get container address mappings: %w", err)
+	}
+	if len(elements) != len(policies) {
+		return fmt.Errorf("managed address mapping count = %d, want %d (unselected endpoints must not be mapped)", len(elements), len(policies))
 	}
 	for _, policy := range policies {
 		mappedChain := ""

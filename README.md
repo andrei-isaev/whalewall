@@ -116,7 +116,9 @@ host `NET_ADMIN`.
 Whalewall is an IPv4 layer-3/layer-4 policy manager, not a complete hostile-workload isolation
 boundary for containers on the same layer-2 bridge. It identifies a container by its IPv4 address;
 it does not bind that identity to a bridge port, MAC address, or cgroup, and the `ip` table does not
-filter ARP or IPv6. Docker grants `NET_RAW` by default, which permits raw and packet sockets. Drop
+filter ARP or IPv6. Do not use overlapping IPv4 addresses or subnets across Docker networks on the
+host: the dispatcher is address-keyed and cannot distinguish identical addresses on different
+interfaces. Docker grants `NET_RAW` by default, which permits raw and packet sockets. Drop
 `NET_RAW` from every managed workload that does not need it (prefer `cap_drop: [ALL]` followed by
 only the capabilities the workload actually needs). This materially reduces IP/ARP spoofing risk,
 but it does not turn a shared bridge into a strong security boundary.
@@ -235,11 +237,19 @@ Whalewall uses Docker labels for configuration:
 
 - `whalewall.enabled` is used to enable or disable firewall rules for a container. If this label is
 not present and set to `true` for a container, whalewall will not create any firewall rules for it.
+- `whalewall.managed_networks` optionally limits enforcement to a comma-separated list of attached
+Docker networks, for example `proxy` or `proxy,monitoring`. If it is absent, every attached network
+is managed as before. Compose network keys are resolved against their project-prefixed Docker names.
 - `whalewall.rules` specifies the firewall rules for a container. If this label is not specified but
 `whalewall.enabled=true` is, no traffic will be allowed to or from the container (unless another
 container has an output rule for this container).
 
 The contents of the `whalewall.rules` label is a yaml config.
+
+With a valid explicit network scope, only addresses on the selected networks enter Whalewall; other
+attached networks pass through unchanged. A malformed, empty, duplicate, or unresolved scope is
+treated as unsafe and quarantines every usable attached IPv4 address. Once the scope is valid, a
+rules error quarantines only the selected networks.
 
 Whalewall creates rules with a default drop policy, meaning any traffic not explicitly allowed will
 be dropped. A Whalewall allow returns the packet to the remaining Docker and host firewall chains;
@@ -248,6 +258,11 @@ those downstream rules can still deny it. Whalewall does not override Docker bri
 Configuration is decoded strictly. In particular:
 
 - `output` is a YAML list, so every rule starts with `-`.
+- `container`, `containers`, and `ips` are mutually exclusive destination selectors. Empty
+  selectors, blank container-list entries, and duplicate container-list entries are rejected.
+- An output rule's `network` must be managed by the source. Named destinations must also manage the
+  same concrete Docker network. Every member of a `containers` list is validated before any part of
+  that policy is installed.
 - Use the current `src_ports` and `dst_ports` list fields. The old singular `port` field is rejected.
 - Ports and port-range endpoints must be between 1 and 65535; a range's start cannot exceed its end.
 - IP addresses, CIDRs, and ranges must be IPv4. IPv6 values are rejected rather than partially
@@ -285,6 +300,7 @@ services:
       - "0.0.0.0:443:443/tcp"
     labels:
       whalewall.enabled: "true"
+      whalewall.managed_networks: "proxy"
       whalewall.rules: |
         mapped_ports:
           external:
@@ -308,6 +324,7 @@ services:
     labels:
       # No app output rules: deny all app-initiated connections.
       whalewall.enabled: "true"
+      whalewall.managed_networks: "proxy"
     networks:
       - proxy
 
@@ -318,7 +335,23 @@ networks:
 ```
 
 The proxy's output rule creates the corresponding established-return rule for `app`; do not add a
-broad app-to-proxy rule. Repeat the proxy output entry for each backend and service port. Confirm
+broad app-to-proxy rule. Backends sharing the same protocol and ports can be listed without changing
+the policy semantics:
+
+```yaml
+output:
+  - network: proxy
+    containers:
+      - authelia
+      - jellyfin
+      - homepage
+    proto: tcp
+    dst_ports:
+      - 8080
+```
+
+Each list entry is resolved as an independent named-container rule, in the declared order, and one
+invalid or unresolved entry rejects the complete policy. Confirm
 `docker network inspect <actual-network-name> --format '{{.EnableIPv6}}'` prints `false`. Compose
 normally prefixes the network key with its project name. For hostile workloads, replace the shared
 `proxy` network with one bridge per Caddy-to-backend edge so unrelated services do not share a
@@ -411,14 +444,13 @@ mapped_ports:
 output:
     # optional; log new outbound traffic that this rule will match
   - log_prefix: ""
-    # optional; a Docker network traffic will be allowed out of. If unset, will default to all 
-    # networks the container is a member of. Required if 'container' is set
+    # optional; a managed Docker network traffic will be allowed out of. If unset, defaults to all
+    # networks selected by whalewall.managed_networks. Required for container/containers
     network: ""
-    # optional; a list of IP addresses, CIDRs, or ranges of IP addresses to allow traffic to
-    ips: []
-    # optional; a container to allow traffic to. This can be either the name of the container or
-    # the service name of the container is docker compose is used
-    container: ""
+    # optional destination selector; omit all three to match any destination, or set exactly one:
+    # ips: [192.0.2.10, 198.51.100.0/24]
+    # container: app
+    # containers: [authelia, jellyfin, homepage]
     # required; either 'tcp' or 'udp'
     proto: ""
     # optional; a list of source ports to allow traffic to. Can be a single port or a

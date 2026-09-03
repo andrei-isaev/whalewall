@@ -11,6 +11,7 @@ services:
     image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
     labels:
       whalewall.enabled: true
+      whalewall.managed_networks: default
       whalewall.rules: |
         mapped_ports:
           localhost:
@@ -46,7 +47,10 @@ services:
               - 10-20
     networks:
       default:
+        gw_priority: 1
         ipv4_address: 172.29.203.2
+      monitoring:
+        ipv4_address: 172.29.204.2
     ports:
       - "0.0.0.0:8080:80"
       - "0.0.0.0:8080:80/udp"
@@ -61,13 +65,17 @@ services:
     image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
     labels:
       whalewall.enabled: true
+      whalewall.managed_networks: default
       whalewall.rules: |
         mapped_ports:
           external:
             allow: true
     networks:
       default:
+        gw_priority: 1
         ipv4_address: 172.29.203.3
+      monitoring:
+        ipv4_address: 172.29.204.3
     ports:
       - "0.0.0.0:8081:80"
       - "0.0.0.0:8081:80/udp"
@@ -89,3 +97,7 @@ networks:
     ipam:
       config:
         - subnet: 172.29.203.0/24
+  monitoring:
+    ipam:
+      config:
+        - subnet: 172.29.204.0/24

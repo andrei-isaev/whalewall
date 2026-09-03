@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 
 	"go.uber.org/zap/zapcore"
+	"go.yaml.in/yaml/v3"
 	"go4.org/netipx"
 )
 
@@ -37,14 +39,15 @@ type externalRules struct {
 }
 
 type ruleConfig struct {
-	LogPrefix string `yaml:"log_prefix"`
-	Network   string
-	IPs       []addrOrRange
-	Container string
-	Proto     protocol
-	SrcPorts  []rulePorts `yaml:"src_ports"`
-	DstPorts  []rulePorts `yaml:"dst_ports"`
-	Verdict   verdict
+	LogPrefix  string `yaml:"log_prefix"`
+	Network    string
+	IPs        []addrOrRange
+	Container  string
+	Containers []string
+	Proto      protocol
+	SrcPorts   []rulePorts `yaml:"src_ports"`
+	DstPorts   []rulePorts `yaml:"dst_ports"`
+	Verdict    verdict
 
 	// Persisted routing identity for waiting rules. These fields are excluded
 	// from user YAML but exported so gob records cannot later resolve a shared
@@ -55,7 +58,140 @@ type ruleConfig struct {
 	NetworkID             string `yaml:"-"`
 	IdentityVersion       uint8  `yaml:"-"`
 
-	skip bool
+	skip              bool
+	fromContainerList bool
+	containerSet      bool
+	containersSet     bool
+	ipsSet            bool
+}
+
+// UnmarshalYAML records selector-field presence so an explicitly empty
+// container/list cannot silently turn into a wildcard destination rule. A
+// custom unmarshaler bypasses Decoder.KnownFields for this node, so the node is
+// checked explicitly before decoding. Decoding the original node (instead of
+// marshaling and reparsing it) preserves aliases whose anchors live elsewhere
+// in the document.
+func (r *ruleConfig) UnmarshalYAML(node *yaml.Node) error {
+	type plainRuleConfig ruleConfig
+	var selectors ruleSelectorPresence
+	if err := inspectRuleYAML(node, &selectors, make(map[*yaml.Node]struct{})); err != nil {
+		return err
+	}
+	var decoded plainRuleConfig
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*r = ruleConfig(decoded)
+	r.ipsSet = selectors.ips
+	r.containerSet = selectors.container
+	r.containersSet = selectors.containers
+	return nil
+}
+
+type ruleSelectorPresence struct {
+	ips        bool
+	container  bool
+	containers bool
+}
+
+func inspectRuleYAML(node *yaml.Node, selectors *ruleSelectorPresence, seen map[*yaml.Node]struct{}) error {
+	node = dereferenceYAMLAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	if _, visited := seen[node]; visited {
+		return nil
+	}
+	seen[node] = struct{}{}
+
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if isYAMLMergeKey(key) {
+			if err := inspectRuleYAMLMerge(value, selectors, seen); err != nil {
+				return err
+			}
+			continue
+		}
+		switch key.Value {
+		case "log_prefix", "network", "proto", "src_ports", "dst_ports":
+		case "ips":
+			selectors.ips = true
+		case "container":
+			selectors.container = true
+		case "containers":
+			selectors.containers = true
+		case "verdict":
+			if err := inspectVerdictYAML(value, make(map[*yaml.Node]struct{})); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("line %d: field %s not found in type whalewall.ruleConfig", key.Line, key.Value)
+		}
+	}
+	return nil
+}
+
+func inspectRuleYAMLMerge(node *yaml.Node, selectors *ruleSelectorPresence, seen map[*yaml.Node]struct{}) error {
+	node = dereferenceYAMLAlias(node)
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			if err := inspectRuleYAML(child, selectors, seen); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return inspectRuleYAML(node, selectors, seen)
+}
+
+func inspectVerdictYAML(node *yaml.Node, seen map[*yaml.Node]struct{}) error {
+	node = dereferenceYAMLAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	if _, visited := seen[node]; visited {
+		return nil
+	}
+	seen[node] = struct{}{}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if isYAMLMergeKey(key) {
+			merged := dereferenceYAMLAlias(value)
+			if merged != nil && merged.Kind == yaml.SequenceNode {
+				for _, child := range merged.Content {
+					if err := inspectVerdictYAML(child, seen); err != nil {
+						return err
+					}
+				}
+			} else if err := inspectVerdictYAML(merged, seen); err != nil {
+				return err
+			}
+			continue
+		}
+		switch key.Value {
+		case "chain", "queue", "input_est_queue", "output_est_queue":
+		default:
+			return fmt.Errorf("line %d: field %s not found in type whalewall.verdict", key.Line, key.Value)
+		}
+	}
+	return nil
+}
+
+func dereferenceYAMLAlias(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node
+}
+
+func isYAMLMergeKey(node *yaml.Node) bool {
+	if node == nil || node.Kind != yaml.ScalarNode || node.Value != "<<" {
+		return false
+	}
+	return node.Tag == "" || node.Tag == "!" || node.Tag == "!!merge" || node.Tag == "tag:yaml.org,2002:merge"
 }
 
 func (r ruleConfig) MarshalLogObject(enc zapcore.ObjectEncoder) error {
@@ -373,16 +509,79 @@ func validateConfig(c config) error {
 	return nil
 }
 
-func validateRule(r ruleConfig) error {
-	if len(r.IPs) == 0 && r.Container == "" && r.Proto == invalidProto && len(r.SrcPorts) == 0 && len(r.DstPorts) == 0 {
-		return errors.New("rule is empty")
-	}
-	if len(r.IPs) != 0 && r.Container != "" {
-		return errors.New(`"ips" and "container" are mutually exclusive`)
+// normalizeConfig validates a user configuration and expands each containers
+// list into independent singular-container rules. Expansion happens in place
+// in the output-rule sequence and preserves the order of names in each list.
+// Downstream rule resolution can therefore keep using the singular Container
+// field, including for persisted waiting rules.
+func normalizeConfig(c config) (config, error) {
+	if err := validateConfig(c); err != nil {
+		return config{}, err
 	}
 
-	if r.Network == "" && r.Container != "" {
-		return errors.New(`"network" must be set when "container" is set`)
+	normalized := make([]ruleConfig, 0, len(c.Output))
+	for _, rule := range c.Output {
+		if rule.Containers == nil {
+			normalized = append(normalized, rule)
+			continue
+		}
+
+		for _, container := range rule.Containers {
+			expanded := rule
+			expanded.Container = container
+			expanded.Containers = nil
+			expanded.fromContainerList = true
+			expanded.containersSet = false
+			normalized = append(normalized, expanded)
+		}
+	}
+	c.Output = normalized
+
+	return c, nil
+}
+
+func validateRule(r ruleConfig) error {
+	hasIPs := r.ipsSet || r.IPs != nil
+	hasContainer := r.containerSet || r.Container != ""
+	hasContainers := r.containersSet || r.Containers != nil
+	destinationFields := 0
+	for _, present := range [...]bool{hasIPs, hasContainer, hasContainers} {
+		if present {
+			destinationFields++
+		}
+	}
+	if destinationFields > 1 {
+		return errors.New(`"ips", "container", and "containers" are mutually exclusive`)
+	}
+
+	if hasContainers {
+		if len(r.Containers) == 0 {
+			return errors.New(`"containers" must contain at least one container`)
+		}
+		seen := make(map[string]int, len(r.Containers))
+		for i, container := range r.Containers {
+			if strings.TrimSpace(container) == "" {
+				return fmt.Errorf(`"containers" entry #%d must not be blank`, i)
+			}
+			if first, ok := seen[container]; ok {
+				return fmt.Errorf(`"containers" entry #%d duplicates entry #%d (%q)`, i, first, container)
+			}
+			seen[container] = i
+		}
+	}
+	if hasContainer && strings.TrimSpace(r.Container) == "" {
+		return errors.New(`"container" must not be empty`)
+	}
+	if hasIPs && len(r.IPs) == 0 {
+		return errors.New(`"ips" must contain at least one address`)
+	}
+
+	if len(r.IPs) == 0 && !hasContainer && !hasContainers && r.Proto == invalidProto && len(r.SrcPorts) == 0 && len(r.DstPorts) == 0 {
+		return errors.New("rule is empty")
+	}
+
+	if r.Network == "" && (hasContainer || hasContainers) {
+		return errors.New(`"network" must be set when "container" or "containers" is set`)
 	}
 
 	if len(r.SrcPorts) != 0 && r.Proto == invalidProto {

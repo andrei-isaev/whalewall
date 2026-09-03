@@ -855,8 +855,12 @@ func TestMappedPortsOnNetworkWithoutGatewayStillCreateExternalRules(t *testing.T
 		},
 		"hardening",
 		mappedPorts{External: externalRules{Allow: true}},
+		map[string]*network.EndpointSettings{
+			"internal": {IPAddress: netip.MustParseAddr("172.31.0.2")},
+		},
 		map[string][]byte{"internal": {172, 31, 0, 2}},
 		&nftables.Chain{Name: "container", Table: filterTable},
+		false,
 	)
 	if err != nil {
 		t.Fatalf("createPortMappingRules() error = %v", err)

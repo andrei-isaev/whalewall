@@ -1,6 +1,7 @@
 package whalewall
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -169,6 +170,222 @@ func TestValidateConfigValidatesMappedPortVerdicts(t *testing.T) {
 	}
 }
 
+func TestValidateRuleContainerDestinations(t *testing.T) {
+	tests := []struct {
+		name    string
+		rule    ruleConfig
+		wantErr string
+	}{
+		{
+			name: "singular container",
+			rule: ruleConfig{Network: "proxy", Container: "authelia"},
+		},
+		{
+			name: "container list",
+			rule: ruleConfig{Network: "proxy", Containers: []string{"authelia", "jellyfin", "homepage"}},
+		},
+		{
+			name: "container and containers",
+			rule: ruleConfig{
+				Network:    "proxy",
+				Container:  "authelia",
+				Containers: []string{"jellyfin"},
+			},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "container and present empty ips",
+			rule: ruleConfig{
+				Network:   "proxy",
+				Container: "authelia",
+				IPs:       []addrOrRange{},
+			},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "containers and present empty ips",
+			rule: ruleConfig{
+				Network:    "proxy",
+				Containers: []string{"authelia"},
+				IPs:        []addrOrRange{},
+			},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "empty container list",
+			rule:    ruleConfig{Network: "proxy", Containers: []string{}},
+			wantErr: "must contain at least one container",
+		},
+		{
+			name:    "empty container entry",
+			rule:    ruleConfig{Network: "proxy", Containers: []string{"authelia", ""}},
+			wantErr: `entry #1 must not be blank`,
+		},
+		{
+			name:    "whitespace container entry",
+			rule:    ruleConfig{Network: "proxy", Containers: []string{"\t "}},
+			wantErr: `entry #0 must not be blank`,
+		},
+		{
+			name:    "duplicate container entry",
+			rule:    ruleConfig{Network: "proxy", Containers: []string{"authelia", "jellyfin", "authelia"}},
+			wantErr: `entry #2 duplicates entry #0 ("authelia")`,
+		},
+		{
+			name:    "singular container requires network",
+			rule:    ruleConfig{Container: "authelia"},
+			wantErr: `"network" must be set`,
+		},
+		{
+			name:    "container list requires network",
+			rule:    ruleConfig{Containers: []string{"authelia"}},
+			wantErr: `"network" must be set`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRule(tt.rule)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRule() returned an error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateRule() error = %v; want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNormalizeConfigExpandsContainerListsInOrder(t *testing.T) {
+	input := config{
+		MappedPorts: mappedPorts{
+			Localhost: localRules{Allow: true, LogPrefix: "localhost"},
+		},
+		Output: []ruleConfig{
+			{
+				LogPrefix: "dns",
+				Proto:     udp,
+				DstPorts:  []rulePorts{{single: 53}},
+			},
+			{
+				LogPrefix:  "backend",
+				Network:    "proxy",
+				Containers: []string{"authelia", "jellyfin", "homepage"},
+				Proto:      tcp,
+				SrcPorts:   []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:   []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:    verdict{drop: true},
+			},
+			{
+				LogPrefix: "database",
+				Network:   "application",
+				Container: "postgres",
+				Proto:     tcp,
+				DstPorts:  []rulePorts{{single: 5432}},
+			},
+		},
+	}
+
+	got, err := normalizeConfig(input)
+	if err != nil {
+		t.Fatalf("normalizeConfig() returned an error: %v", err)
+	}
+
+	want := config{
+		MappedPorts: input.MappedPorts,
+		Output: []ruleConfig{
+			input.Output[0],
+			{
+				LogPrefix:         "backend",
+				Network:           "proxy",
+				Container:         "authelia",
+				Proto:             tcp,
+				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:           verdict{drop: true},
+				fromContainerList: true,
+			},
+			{
+				LogPrefix:         "backend",
+				Network:           "proxy",
+				Container:         "jellyfin",
+				Proto:             tcp,
+				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:           verdict{drop: true},
+				fromContainerList: true,
+			},
+			{
+				LogPrefix:         "backend",
+				Network:           "proxy",
+				Container:         "homepage",
+				Proto:             tcp,
+				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:           verdict{drop: true},
+				fromContainerList: true,
+			},
+			input.Output[2],
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeConfig() = %#v; want %#v", got, want)
+	}
+
+	// Normalization must not rewrite the caller's original rule or its list.
+	if !reflect.DeepEqual(input.Output[1].Containers, []string{"authelia", "jellyfin", "homepage"}) || input.Output[1].Container != "" {
+		t.Fatalf("normalizeConfig() mutated its input list rule: %#v", input.Output[1])
+	}
+}
+
+func TestNormalizeConfigRejectsBeforeExpansion(t *testing.T) {
+	_, err := normalizeConfig(config{Output: []ruleConfig{
+		{Network: "proxy", Containers: []string{"authelia", ""}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "output rule #0") || !strings.Contains(err.Error(), "entry #1") {
+		t.Fatalf("normalizeConfig() error = %v; want indexed rule and container entry", err)
+	}
+}
+
+func TestContainerListYAMLDecodeAndNormalize(t *testing.T) {
+	const input = `output:
+  - network: proxy
+    containers:
+      - authelia
+      - jellyfin
+      - homepage
+    proto: tcp
+    dst_ports:
+      - 443
+`
+	dec := yaml.NewDecoder(strings.NewReader(input))
+	dec.KnownFields(true)
+	var decoded config
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decoding container list returned an error: %v", err)
+	}
+	if len(decoded.Output) != 1 || !reflect.DeepEqual(decoded.Output[0].Containers, []string{"authelia", "jellyfin", "homepage"}) {
+		t.Fatalf("decoded container list = %#v; want source order preserved", decoded.Output)
+	}
+
+	normalized, err := normalizeConfig(decoded)
+	if err != nil {
+		t.Fatalf("normalizeConfig() returned an error: %v", err)
+	}
+	if len(normalized.Output) != 3 {
+		t.Fatalf("normalized output length = %d; want 3", len(normalized.Output))
+	}
+	for i, wantName := range []string{"authelia", "jellyfin", "homepage"} {
+		got := normalized.Output[i]
+		if got.Container != wantName || got.Containers != nil || !got.fromContainerList {
+			t.Fatalf("normalized output rule #%d = %#v; want singular list-origin rule for %q", i, got, wantName)
+		}
+	}
+}
+
 func TestRulesConfigStrictDecoding(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -188,12 +405,162 @@ func TestRulesConfigStrictDecoding(t *testing.T) {
 `,
 		},
 		{
+			name: "container list syntax",
+			input: `output:
+  - network: proxy
+    containers:
+      - authelia
+      - jellyfin
+      - homepage
+    proto: tcp
+    dst_ports:
+      - 443
+`,
+		},
+		{
+			name: "container list must be a list",
+			input: `output:
+  - network: proxy
+    containers: authelia
+`,
+			wantErr: "cannot unmarshal",
+		},
+		{
+			name: "empty singular container is rejected",
+			input: `output:
+  - network: proxy
+    container: ""
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"container" must not be empty`,
+		},
+		{
+			name: "null container list is rejected",
+			input: `output:
+  - network: proxy
+    containers: null
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"containers" must contain at least one container`,
+		},
+		{
+			name: "empty container list is rejected",
+			input: `output:
+  - network: proxy
+    containers: []
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"containers" must contain at least one container`,
+		},
+		{
+			name: "null singular container is rejected",
+			input: `output:
+  - network: proxy
+    container: null
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"container" must not be empty`,
+		},
+		{
+			name: "selector presence is mutually exclusive",
+			input: `output:
+  - network: proxy
+    ips: []
+    containers:
+      - authelia
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "empty IP selector is rejected",
+			input: `output:
+  - network: proxy
+    ips: []
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"ips" must contain at least one address`,
+		},
+		{
+			name: "null IP selector is rejected",
+			input: `output:
+  - network: proxy
+    ips: null
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: `"ips" must contain at least one address`,
+		},
+		{
+			name: "null selector remains mutually exclusive",
+			input: `output:
+  - network: proxy
+    container: null
+    containers: [authelia]
+    proto: tcp
+    dst_ports: [443]
+`,
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "cross-rule list alias remains supported",
+			input: `output:
+  - network: proxy
+    containers: &backends [authelia, jellyfin]
+  - network: proxy
+    containers: *backends
+`,
+		},
+		{
+			name: "unknown output field remains rejected",
+			input: `output:
+  - network: proxy
+    container_selector: authelia
+`,
+			wantErr: "field container_selector not found",
+		},
+		{
 			name: "removed singular port syntax",
 			input: `output:
   - proto: tcp
     port: 443
 `,
 			wantErr: "field port not found",
+		},
+		{
+			name: "unknown verdict field remains rejected",
+			input: `output:
+  - proto: tcp
+    dst_ports: [443]
+    verdict:
+      accept: true
+`,
+			wantErr: "field accept not found",
+		},
+		{
+			name: "quoted merge-like verdict key remains rejected",
+			input: `output:
+  - proto: tcp
+    dst_ports: [443]
+    verdict:
+      "<<": {queue: 1}
+`,
+			wantErr: "field << not found",
+		},
+		{
+			name: "quoted merge-like rule key remains rejected",
+			input: `output:
+  - proto: tcp
+    dst_ports: [443]
+    "<<": {network: proxy}
+`,
+			wantErr: "field << not found",
 		},
 		{
 			name: "output must be a list",
