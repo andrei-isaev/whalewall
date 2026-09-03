@@ -57,7 +57,6 @@ jobs:
               "iptables": true,
               "ip6tables": false,
               "ipv6": false,
-              "bridge": "ww-ci0",
               "bip": "172.31.0.1/24"
             }
 
@@ -109,7 +108,6 @@ jobs:
               "iptables": true,
               "ip6tables": false,
               "ipv6": false,
-              "bridge": "ww-ci0",
               "bip": "172.31.0.1/24"
             }
 
@@ -162,7 +160,6 @@ jobs:
               "iptables": true,
               "ip6tables": false,
               "ipv6": false,
-              "bridge": "ww-ci0",
               "bip": "172.31.0.1/24"
             }
 
