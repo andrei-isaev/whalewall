@@ -92,8 +92,10 @@ func TestIntegration(t *testing.T) {
 	})
 
 	// Do not turn an early Whalewall crash or a slow event reconciliation into
-	// misleading connectivity failures. Wait until both opted-in containers are
-	// mapped to complete, fail-closed policies before making network assertions.
+	// misleading connectivity failures. Wait until every opted-in container is
+	// mapped to its complete policy before making network assertions. A complete
+	// policy can intentionally contain only the canonical drop when its sole
+	// mapped-port policy is outside the explicit managed-network scope.
 	waitForIntegrationState(t, "initial container policies", whalewall, func() error {
 		return checkInitialContainerPolicies(dockerClient)
 	})
@@ -375,19 +377,21 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 	}
 
 	type expectedPolicy struct {
-		name      string
-		container container.InspectResponse
-		address   netip.Addr
-		chain     *nftables.Chain
+		name           string
+		container      container.InspectResponse
+		address        netip.Addr
+		chain          *nftables.Chain
+		expectOnlyDrop bool
 	}
 	policies := make([]expectedPolicy, 0, 3)
 	for _, item := range []struct {
-		name      string
-		container container.InspectResponse
+		name           string
+		container      container.InspectResponse
+		expectOnlyDrop bool
 	}{
 		{name: "client", container: clientResult.Container},
 		{name: "server", container: serverResult.Container},
-		{name: "unmanaged-primary", container: unmanagedPrimaryResult.Container},
+		{name: "unmanaged-primary", container: unmanagedPrimaryResult.Container, expectOnlyDrop: true},
 	} {
 		if item.container.NetworkSettings == nil {
 			return fmt.Errorf("container %q has no network settings", item.name)
@@ -405,9 +409,10 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 			address = endpoint.IPAddress
 		}
 		policies = append(policies, expectedPolicy{
-			name:      item.name,
-			container: item.container,
-			address:   address,
+			name:           item.name,
+			container:      item.container,
+			address:        address,
+			expectOnlyDrop: item.expectOnlyDrop,
 			chain: &nftables.Chain{
 				Name:  buildChainName(item.name, item.container.ID),
 				Table: filterTable,
@@ -477,7 +482,10 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 				clientHasServerRule = true
 			}
 		}
-		if len(rules) == 1 {
+		if policy.expectOnlyDrop && len(rules) != 1 {
+			return fmt.Errorf("container %q chain %q has %d rules, want only its canonical drop for an out-of-scope published endpoint", policy.name, policy.chain.Name, len(rules))
+		}
+		if !policy.expectOnlyDrop && len(rules) == 1 {
 			return fmt.Errorf("container %q chain %q still contains only its fail-closed floor", policy.name, policy.chain.Name)
 		}
 	}
