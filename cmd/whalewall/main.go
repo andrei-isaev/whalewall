@@ -80,6 +80,12 @@ func mainRetCode() int {
 			logger.Sugar().Warnf("current kernel version %q is unsupported, 5.10 or greater is required; whalewall will probably not work correctly", kernelVer)
 		}
 	}
+	if !*clearRules {
+		if err := whalewall.ValidateRuntimePrerequisites(); err != nil {
+			logger.Error("unsupported runtime prerequisites", zap.Error(err))
+			return 1
+		}
+	}
 
 	// create rule manager and drop unneeded privileges
 	dataDirAbs, err := filepath.Abs(*dataDir)
@@ -95,6 +101,7 @@ func mainRetCode() int {
 	r, err := whalewall.NewRuleManager(ctx, logger, sqliteFile, *timeout)
 	if err != nil {
 		logger.Error("error initializing", zap.Error(err))
+		return 1
 	}
 
 	if !restrictPrivileges(logger, sqliteFile, *logPath) {
@@ -131,6 +138,7 @@ func mainRetCode() int {
 		if errors.Is(err, syscall.EPERM) {
 			logger.Info("whalewall seems to lack required permissions, is the NET_ADMIN capability set?")
 		}
+		r.Stop()
 		return 1
 	}
 

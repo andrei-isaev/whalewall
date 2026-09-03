@@ -6,16 +6,22 @@ on:
       - master
     paths:
       - "**.go"
+      - ".dockerignore"
+      - "Dockerfile"
       - "go.mod"
       - "go.sum"
+      - "testdata/**"
       - ".github/workflows/test.yml"
   pull_request:
     branches:
       - "*"
     paths:
       - "**.go"
+      - ".dockerignore"
+      - "Dockerfile"
       - "go.mod"
       - "go.sum"
+      - "testdata/**"
       - ".github/workflows/test.yml"
 
   workflow_dispatch: {}
@@ -26,92 +32,161 @@ permissions:
 jobs:
   race-test:
     # required for nftables to work correctly
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare host networking
+        run: |
+          sudo systemctl stop docker.service docker.socket
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
+      - name: Set up target Docker
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.7.2
+          set-host: true
+          daemon-config: |
+            {
+              "firewall-backend": "iptables",
+              "iptables": true,
+              "ip6tables": false,
+              "ipv6": false,
+              "bridge": "ww-ci0",
+              "bip": "172.31.0.1/24"
+            }
+
+      - name: Verify target Docker
+        run: |
+          test "$(docker version --format '{{.Server.Version}}')" = "29.7.2"
+          docker info --format '{{json .FirewallBackend}}' | jq -e '.Driver == "iptables"'
+          sudo iptables --version | grep -F '(nf_tables)'
+          sudo nft list chain ip filter DOCKER-USER
 
       - name: Install Go
-        uses: actions/setup-go@v6.3.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
-      - name: Restore Go cache
-        uses: capnspacehook/cache-go/restore@v2.0.1
+      - name: Test unprivileged packages
+        run: go test -race -count=1 ./container ./database
 
       # the test is compiled and run as root so that whalewall can
       # interface with nftables, which is a privileged operation
       - run: |
           go test -c -race -o whalewall.test
-          sudo ./whalewall.test -test.timeout 5m -test.v
-
-      - name: Save Go cache
-        if: always()
-        uses: capnspacehook/cache-go/save@v2.0.1
+          sudo --preserve-env=DOCKER_HOST ./whalewall.test -test.timeout 5m -test.v
 
   binary-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare host networking
+        run: |
+          sudo systemctl stop docker.service docker.socket
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
+      - name: Set up target Docker
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.7.2
+          set-host: true
+          daemon-config: |
+            {
+              "firewall-backend": "iptables",
+              "iptables": true,
+              "ip6tables": false,
+              "ipv6": false,
+              "bridge": "ww-ci0",
+              "bip": "172.31.0.1/24"
+            }
+
+      - name: Verify target Docker
+        run: |
+          test "$(docker version --format '{{.Server.Version}}')" = "29.7.2"
+          docker info --format '{{json .FirewallBackend}}' | jq -e '.Driver == "iptables"'
+          sudo iptables --version | grep -F '(nf_tables)'
+          sudo nft list chain ip filter DOCKER-USER
 
       - name: Install Go
-        uses: actions/setup-go@v6.3.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Restore Go cache
-        uses: capnspacehook/cache-go/restore@v2.0.1
+          cache: true
 
       # run the integration tests but use a binary to create rules
       # to test with landlock and seccomp filters active
       - run: |
+          CGO_ENABLED=0 go test ./cmd/whalewall -run '^TestSeccompRuntimeCompatibility$' -count=1 -v
           cd cmd/whalewall
-          CGO_ENABLED=0 go build -o ../../whalewall
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../../whalewall
           cd ../../
           go test -c -o whalewall.test
-          sudo ./whalewall.test -binary-tests -test.run Integration -test.timeout 5m -test.v
-
-      - name: Save Go cache
-        if: always()
-        uses: capnspacehook/cache-go/save@v2.0.1
+          sudo --preserve-env=DOCKER_HOST ./whalewall.test -binary-tests -test.run Integration -test.timeout 5m -test.v
 
   image-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install Docker buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Prepare host networking
+        run: |
+          sudo systemctl stop docker.service docker.socket
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
+      - name: Set up target Docker
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.7.2
+          set-host: true
+          daemon-config: |
+            {
+              "firewall-backend": "iptables",
+              "iptables": true,
+              "ip6tables": false,
+              "ipv6": false,
+              "bridge": "ww-ci0",
+              "bip": "172.31.0.1/24"
+            }
+
+      - name: Link target Docker socket for the container test
+        run: sudo ln -sfn "${DOCKER_HOST#unix://}" /var/run/docker.sock
+
+      - name: Verify target Docker
+        run: |
+          test "$(docker version --format '{{.Server.Version}}')" = "29.7.2"
+          docker info --format '{{json .FirewallBackend}}' | jq -e '.Driver == "iptables"'
+          sudo iptables --version | grep -F '(nf_tables)'
+          sudo nft list chain ip filter DOCKER-USER
 
       - name: Ensure Docker image builds
-        uses: docker/build-push-action@v6
-        with:
-          load: true
-          push: false
-          tags: whalewall:test
+        run: docker build --pull --platform=linux/amd64 --build-arg VERSION="${GITHUB_SHA}" --tag whalewall:test .
 
       - name: Install Go
-        uses: actions/setup-go@v6.3.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Restore Go cache
-        uses: capnspacehook/cache-go/restore@v2.0.1
+          cache: true
 
       # run the integration tests but use a container to create rules
       # to test with landlock and seccomp filters active
       - run: |
           go test -c -o whalewall.test
-          sudo ./whalewall.test -container-tests -test.run Integration -test.timeout 5m -test.v
-
-      - name: Save Go cache
-        if: always()
-        uses: capnspacehook/cache-go/save@v2.0.1
+          sudo --preserve-env=DOCKER_HOST ./whalewall.test -container-tests -test.run Integration -test.timeout 5m -test.v

@@ -18,14 +18,36 @@ on:
       - "go.sum"
       - ".github/workflows/codeql.yml"
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "19 2 * * 1"
 
   workflow_dispatch: {}
 
 jobs:
   codeql:
+    runs-on: ubuntu-24.04
     permissions:
-      actions: write
+      actions: read
       contents: read
       security-events: write
-    uses: capnspacehook/go-workflows/.github/workflows/codeql.yml@master
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: go
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9

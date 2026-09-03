@@ -1,9 +1,14 @@
-version: "3"
 services:
   client:
+    cap_drop:
+      - ALL
+    # Test-only: nmap's UDP scan uses raw sockets. Production workloads should
+    # continue to drop NET_RAW unless they have an application requirement for it.
+    cap_add:
+      - NET_RAW
     container_name: client
     command: "80"
-    image: ghcr.io/capnspacehook/eavesdropper
+    image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
     labels:
       whalewall.enabled: true
       whalewall.rules: |
@@ -27,6 +32,11 @@ services:
             proto: tcp
             dst_ports: 
               - 756
+          - network: default
+            container: server
+            proto: udp
+            dst_ports:
+              - 757
           - proto: tcp
             ips:
               - 2.2.2.2-3.3.3.3
@@ -34,26 +44,48 @@ services:
             dst_ports:
               - 1-5
               - 10-20
+    networks:
+      default:
+        ipv4_address: 172.29.203.2
     ports:
-      - "8080:80"
+      - "0.0.0.0:8080:80"
+      - "0.0.0.0:8080:80/udp"
 
   server:
+    cap_drop:
+      - ALL
     container_name: server
-    command: "80 756 9001"
+    command: "80 756 757 9001"
     depends_on:
       - client
-    image: ghcr.io/capnspacehook/eavesdropper
+    image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
     labels:
       whalewall.enabled: true
       whalewall.rules: |
         mapped_ports:
           external:
             allow: true
+    networks:
+      default:
+        ipv4_address: 172.29.203.3
     ports:
-      - "8081:80"
-      - "9001:9001"
+      - "0.0.0.0:8081:80"
+      - "0.0.0.0:8081:80/udp"
+      - "0.0.0.0:9001:9001"
+      - "0.0.0.0:9001:9001/udp"
 
   tester:
+    cap_drop:
+      - ALL
+    # Test-only: nmap's UDP scan uses raw sockets.
+    cap_add:
+      - NET_RAW
     command: "8443"
-    image: ghcr.io/capnspacehook/eavesdropper
+    image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
     network_mode: host
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.203.0/24

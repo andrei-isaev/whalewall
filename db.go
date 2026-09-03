@@ -9,7 +9,7 @@ import (
 
 // TODO: use 'go run' when https://github.com/golang/go/issues/33468 is fixed
 // or use 'go tool' instead if https://github.com/golang/go/issues/48429 is implemented
-//go:generate go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.20.0
+//go:generate go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
 //go:generate sqlc generate
 
 func (r *RuleManager) containerExists(ctx context.Context, db database.Querier, id string) (bool, error) {
@@ -17,10 +17,16 @@ func (r *RuleManager) containerExists(ctx context.Context, db database.Querier, 
 	if err != nil {
 		return false, err
 	}
-	return exists == 1, nil
+	return exists, nil
 }
 
-func (r *RuleManager) addContainer(ctx context.Context, tx database.TX, id, name, service string, addrs map[string][]byte, estContainers map[string]struct{}) error {
+func replaceContainerMetadata(ctx context.Context, tx database.TX, id, name, service string, addrs map[string][]byte) error {
+	if err := tx.AddContainer(ctx, id, name); err != nil {
+		return fmt.Errorf("error adding container: %w", err)
+	}
+	if err := tx.DeleteContainerAddrs(ctx, id); err != nil {
+		return fmt.Errorf("error clearing stale container addrs: %w", err)
+	}
 	for _, addr := range addrs {
 		err := tx.AddContainerAddr(ctx, addr, id)
 		if err != nil {
@@ -30,6 +36,9 @@ func (r *RuleManager) addContainer(ctx context.Context, tx database.TX, id, name
 
 	// add names the container may have been referred to in user rules
 	// so when creating rules that specify this container it can be found
+	if err := tx.DeleteContainerAliases(ctx, id); err != nil {
+		return fmt.Errorf("error clearing stale container aliases: %w", err)
+	}
 	aliases := containerAliases(name, service)
 	for _, alias := range aliases {
 		err := tx.AddContainerAlias(ctx, id, alias)
@@ -38,8 +47,35 @@ func (r *RuleManager) addContainer(ctx context.Context, tx database.TX, id, name
 		}
 	}
 
-	// keep track if rules were put into other container's chains so
-	// they can be cleaned up when this container is stopped
+	return nil
+}
+
+func resetContainerPolicy(ctx context.Context, tx database.TX, id string) error {
+	if err := tx.DeleteWaitingContainerRules(ctx, id); err != nil {
+		return fmt.Errorf("error deleting stale waiting container rules: %w", err)
+	}
+	if err := tx.DeleteSourceEstContainers(ctx, id); err != nil {
+		return fmt.Errorf("error deleting stale established-container relationships: %w", err)
+	}
+	return nil
+}
+
+func (r *RuleManager) clearContainerPolicyMetadata(ctx context.Context, id string) error {
+	tx, err := r.db.Begin(ctx, r.logger)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := resetContainerPolicy(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *RuleManager) finalizeContainerPolicy(ctx context.Context, tx database.TX, id string, estContainers map[string]struct{}) error {
+	// Keep track if rules were put into other containers' chains so they
+	// can be cleaned up when this container is stopped. Inserts are
+	// idempotent so periodic reconciliation can safely repeat them.
 	for estContainer := range estContainers {
 		err := tx.AddEstContainer(ctx, id, estContainer)
 		if err != nil {

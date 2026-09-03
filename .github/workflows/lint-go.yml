@@ -6,6 +6,7 @@ on:
       - master
     paths:
       - "**.go"
+      - ".golangci.yml"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/lint-go.yml"
@@ -14,6 +15,7 @@ on:
       - "*"
     paths:
       - "**.go"
+      - ".golangci.yml"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/lint-go.yml"
@@ -22,6 +24,20 @@ on:
 
 jobs:
   lint-go:
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-    uses: capnspacehook/go-workflows/.github/workflows/lint-go.yml@master
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run

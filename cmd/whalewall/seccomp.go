@@ -74,6 +74,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 		},
 	},
 	unix.SYS_EPOLL_PWAIT: {},
+	unix.SYS_EXIT:        {},
 	unix.SYS_EXIT_GROUP:  {},
 	unix.SYS_FCHMOD: {
 		{
@@ -149,13 +150,25 @@ var allowedSyscalls = seccomp.SyscallRules{
 	unix.SYS_LSTAT:   {},
 	unix.SYS_MADVISE: {},
 	unix.SYS_MMAP: {
+		// The Go runtime reserves heap arenas without access before mapping
+		// committed pages over them.
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.PROT_NONE),
+			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS),
+			seccomp.GreaterThan(0),
+			seccomp.EqualTo(0),
+		},
 		{
 			seccomp.MatchAny{},
 			seccomp.MatchAny{},
 			seccomp.EqualTo(unix.PROT_READ | unix.PROT_WRITE),
 			seccomp.EqualTo(unix.MAP_SHARED),
 			seccomp.GreaterThan(0),
-			seccomp.EqualTo(0),
+			// SQLite maps successive WAL-index regions at page-aligned
+			// offsets as the WAL grows.
+			seccomp.MaskedEqual(uintptr(os.Getpagesize()-1), 0),
 		},
 		{
 			seccomp.MatchAny{},
@@ -179,7 +192,19 @@ var allowedSyscalls = seccomp.SyscallRules{
 	unix.SYS_NEWFSTATAT: {},
 	unix.SYS_OPENAT:     {},
 	unix.SYS_PIPE2:      {},
-	unix.SYS_READ:       {},
+	unix.SYS_PRCTL: {
+		// Go 1.25 and newer annotate anonymous runtime mappings by default.
+		{
+			seccomp.EqualTo(unix.PR_SET_VMA),
+			seccomp.EqualTo(unix.PR_SET_VMA_ANON_NAME),
+			seccomp.GreaterThan(0),
+			seccomp.GreaterThan(0),
+			seccomp.GreaterThan(0),
+		},
+	},
+	unix.SYS_PREAD64:  {},
+	unix.SYS_PWRITE64: {},
+	unix.SYS_READ:     {},
 	unix.SYS_RECVMSG: {
 		{
 			seccomp.MatchAny{},
@@ -196,7 +221,15 @@ var allowedSyscalls = seccomp.SyscallRules{
 	unix.SYS_RT_SIGACTION:    {},
 	unix.SYS_RT_SIGPROCMASK:  {},
 	unix.SYS_RT_SIGRETURN:    {},
-	unix.SYS_SCHED_YIELD:     {},
+	unix.SYS_SCHED_GETAFFINITY: {
+		// Go 1.25 and newer periodically recompute the default GOMAXPROCS.
+		{
+			seccomp.EqualTo(0),
+			seccomp.EqualTo(64 * 1024 / 8),
+			seccomp.MatchAny{},
+		},
+	},
+	unix.SYS_SCHED_YIELD: {},
 	unix.SYS_SENDMSG: {
 		{
 			seccomp.MatchAny{},
@@ -230,6 +263,13 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.MatchAny{},
 			seccomp.EqualTo(unix.SOL_SOCKET),
 			seccomp.EqualTo(unix.SO_KEEPALIVE),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(4),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.SOL_TCP),
+			seccomp.EqualTo(unix.TCP_KEEPCNT),
 			seccomp.MatchAny{},
 			seccomp.EqualTo(4),
 		},
@@ -291,8 +331,9 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(uint64(os.Getpid())),
 		},
 	},
-	unix.SYS_TIME:  {},
-	unix.SYS_WRITE: {},
+	unix.SYS_TIME:   {},
+	unix.SYS_UNLINK: {},
+	unix.SYS_WRITE:  {},
 }
 
 type nullEmitter struct{}

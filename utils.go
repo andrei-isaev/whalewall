@@ -2,7 +2,6 @@ package whalewall
 
 import (
 	"context"
-	"errors"
 	"time"
 )
 
@@ -20,14 +19,4 @@ func withTimeout[T, E any](ctx context.Context, timeout time.Duration, f func(ct
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return f(ctx)
-}
-
-// ignoringErr calls f and discards the error if any error in the error
-// tree matches errToIgnore.
-func ignoringErr(f func() error, errToIgnore error) error {
-	err := f()
-	if err == nil || (err != nil && errors.Is(err, errToIgnore)) {
-		return nil
-	}
-	return err
 }

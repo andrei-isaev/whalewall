@@ -2,10 +2,16 @@ package container
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"go.uber.org/zap"
 )
+
+// ErrContainerDeleted is used as a cancellation cause when a Docker die event
+// supersedes in-progress rule creation. It lets callers distinguish that case
+// from manager shutdown, where installed firewall state must be preserved.
+var ErrContainerDeleted = errors.New("container deleted while policy was being created")
 
 type Tracker struct {
 	logger *zap.Logger
@@ -16,7 +22,7 @@ type Tracker struct {
 
 type processingContainer struct {
 	creating  bool
-	cancel    context.CancelFunc
+	cancel    context.CancelCauseFunc
 	noCleanup bool
 	done      chan struct{}
 }
@@ -54,16 +60,19 @@ func (c *Tracker) addContainer(ctx context.Context, id string, creating bool) (c
 		// the current operation
 		if cont.creating && !creating {
 			c.logger.Debug("canceling container creation", zap.String("container.id", id[:12]))
-			cont.cancel()
+			cont.cancel(ErrContainerDeleted)
 			delete(c.containers, id)
-			return ctx, nil, false
+			// Do not acknowledge the delete until the canceled creator's
+			// deferred firewall/database cleanup has completed. This preserves
+			// Docker die -> start ordering for restart-policy containers.
+			<-cont.done
+		} else {
+			c.logger.Debug("waiting on container operation to finish", zap.String("container.id", id[:12]), zap.Bool("container.creating", cont.creating))
+			<-cont.done
 		}
-
-		c.logger.Debug("waiting on container operation to finish", zap.String("container.id", id[:12]), zap.Bool("container.creating", cont.creating))
-		<-cont.done
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	newCont := &processingContainer{
 		creating: creating,
 		cancel:   cancel,
@@ -72,7 +81,7 @@ func (c *Tracker) addContainer(ctx context.Context, id string, creating bool) (c
 	c.containers[id] = newCont
 
 	return ctx, func() {
-		newCont.cancel()
+		newCont.cancel(context.Canceled)
 		close(newCont.done)
 
 		c.mtx.Lock()

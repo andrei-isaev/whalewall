@@ -33,6 +33,11 @@ type db struct {
 type dbtx interface {
 	DBTX
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+	Close() error
+}
+
+func (d *db) Close() error {
+	return errors.Join(d.Queries.Close(), d.db.Close())
 }
 
 type dbRetrier struct {
@@ -72,7 +77,7 @@ func retryIfBusy[T any](f func() (T, error)) (T, error) {
 	var ret T
 	var err error
 
-	for i := 0; i < retries; i++ {
+	for range retries {
 		ret, err = f()
 		if err == nil {
 			return ret, nil
@@ -91,7 +96,9 @@ func retryIfBusy[T any](f func() (T, error)) (T, error) {
 func NewDB(ctx context.Context, database *sql.DB) (DB, error) {
 	queries, err := Prepare(ctx, database)
 	if err != nil {
-		return nil, err
+		// Closing the physical database also closes every statement that sqlc
+		// prepared before a later Prepare call failed.
+		return nil, errors.Join(err, database.Close())
 	}
 	wrappedDB := &dbRetrier{
 		DB: database,

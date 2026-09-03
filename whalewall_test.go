@@ -6,28 +6,29 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/matryer/is"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"go.uber.org/zap"
 	"go4.org/netipx"
-	"golang.org/x/exp/maps"
 	"golang.org/x/sys/unix"
 
 	"github.com/capnspacehook/whalewall/database"
@@ -42,31 +43,35 @@ var (
 	whalewallImage  = flag.String("whalewall-image", "whalewall:test", "Docker image to test with")
 )
 
+//nolint:tparallel // Docker integration subtests intentionally share one compose environment.
 func TestIntegration(t *testing.T) {
 	t.Parallel()
 
 	is := is.New(t)
 
 	checkFirewallRules := func() {
-		is.True(runCmd(t, "client", "nslookup google.com") == 0)                             // udp port 53 is allowed
-		is.True(runCmd(t, "client", "curl --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed
-		is.True(runCmd(t, "client", "curl --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is not allowed
-		is.True(runCmd(t, "client", "curl --connect-timeout 1 https://www.google.com") == 0) // DNS and HTTPS is allowed externally
-		is.True(portOpen(t, "client", "server", 756, false))                                 // tcp port 756 is allowed client -> server
-		is.True(!portOpen(t, "client", "server", 756, true))                                 // udp port 756 is not allowed client -> server
-		is.True(!portOpen(t, "client", "server", 80, false))                                 // tcp port 80 is not allowed client -> server
-		is.True(!portOpen(t, "client", "server", 80, true))                                  // udp port 80 is not allowed client -> server
-		is.True(portOpen(t, "tester", "localhost", 8080, false))                             // tcp mapped port 8080:80 of client is allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 8080, true))                             // udp mapped port 8080:80 of client is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 8081, false))                            // tcp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 8081, true))                             // udp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 9001, false))                            // tcp mapped port 9001:9001 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 9001, true))                             // udp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(runClientCmd(t, "nslookup google.com") == 0)                             // udp port 53 is allowed
+		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed
+		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is not allowed
+		is.True(runClientCmd(t, "curl --connect-timeout 1 https://www.google.com") == 0) // DNS and HTTPS is allowed externally
+		is.True(portOpen(t, "client", "server", 756, false))                             // tcp port 756 is allowed client -> server
+		is.True(!portOpen(t, "client", "server", 756, true))                             // udp port 756 is not allowed client -> server
+		is.True(portOpen(t, "client", "server", 757, true))                              // udp port 757 is allowed client -> server
+		is.True(!portOpen(t, "client", "server", 80, false))                             // tcp port 80 is not allowed client -> server
+		is.True(!portOpen(t, "client", "server", 80, true))                              // udp port 80 is not allowed client -> server
+		is.True(portOpen(t, "tester", "localhost", 8080, false))                         // tcp mapped port 8080:80 of client is allowed from localhost
+		is.True(portOpen(t, "tester", "localhost", 8080, true))                          // udp mapped port 8080:80 of client is allowed from localhost
+		is.True(!portOpen(t, "tester", "localhost", 8081, false))                        // tcp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!portOpen(t, "tester", "localhost", 8081, true))                         // udp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!portOpen(t, "tester", "localhost", 9001, false))                        // tcp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(!portOpen(t, "tester", "localhost", 9001, true))                         // udp mapped port 9001:9001 of server is not allowed from localhost
 	}
 
 	tempDir := t.TempDir()
 	stopWhalewall := startWhalewall(t, is, tempDir)
-	t.Cleanup(stopWhalewall)
+	t.Cleanup(func() {
+		stopWhalewall()
+	})
 
 	is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "up", "-d") == 0)
 	t.Cleanup(func() {
@@ -79,13 +84,14 @@ func TestIntegration(t *testing.T) {
 	checkFirewallRules()
 
 	// ensure correct nftables chains exist
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerClient, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
 	is.NoErr(err)
 	t.Cleanup(func() {
 		dockerClient.Close()
 	})
-	containers, err := dockerClient.ContainerList(context.Background(), types.ContainerListOptions{})
+	containerResult, err := dockerClient.ContainerList(context.Background(), client.ContainerListOptions{})
 	is.NoErr(err)
+	containers := containerResult.Items
 
 	clientChain := getContainerChain("client", containers)
 	is.True(clientChain != nil)
@@ -99,6 +105,58 @@ func TestIntegration(t *testing.T) {
 
 	is.True(chainExists(clientChain.Name, chains))
 	is.True(chainExists(serverChain.Name, chains))
+
+	// Recreate the server at the same fixed IPv4 address. Docker can publish the
+	// replacement start before Whalewall receives the old container's die event,
+	// so this exercises the real nftables IP-reuse path rather than a mock-only
+	// ordering. The map must move to the new full-ID chain atomically, and no
+	// permissive edge owned by the displaced ID may survive.
+	oldServerChain := serverChain
+	oldServerID, err := containerIDFromChainName(oldServerChain.Name)
+	if err != nil {
+		t.Fatalf("parse original server chain identity: %v", err)
+	}
+	if run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "up", "-d", "--force-recreate", "--no-deps", "server") != 0 {
+		t.Fatal("force-recreating the fixed-IP server failed")
+	}
+
+	serverResult, err := dockerClient.ContainerInspect(context.Background(), "server", client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect replacement server: %v", err)
+	}
+	server := serverResult.Container
+	if server.ID == oldServerID {
+		t.Fatalf("force-recreate retained original server ID %s", oldServerID)
+	}
+	serverChain = &nftables.Chain{
+		Name:  buildChainName("server", server.ID),
+		Table: filterTable,
+	}
+	var serverAddr netip.Addr
+	// Compose derives the network name from the project/directory, so discover
+	// the sole bridge endpoint instead of relying on a runner-specific name.
+	for _, endpoint := range server.NetworkSettings.Networks {
+		if endpoint != nil && endpoint.IPAddress.IsValid() {
+			serverAddr = endpoint.IPAddress
+			break
+		}
+	}
+	if !serverAddr.Is4() {
+		t.Fatalf("replacement server has no valid IPv4 endpoint: %+v", server.NetworkSettings.Networks)
+	}
+
+	waitForIntegrationState(t, 15*time.Second, "same-address replacement policy", func() error {
+		return checkReplacementPolicy(serverAddr, clientChain.Name, oldServerChain.Name, oldServerID, serverChain.Name, server.ID, false, false)
+	})
+
+	// Startup reconciliation must remove the quarantined old chain while
+	// preserving both the address verdict and the replacement peer policy.
+	stopWhalewall()
+	stopWhalewall = startWhalewall(t, is, tempDir)
+	waitForIntegrationState(t, 15*time.Second, "replacement policy after Whalewall restart", func() error {
+		return checkReplacementPolicy(serverAddr, clientChain.Name, oldServerChain.Name, oldServerID, serverChain.Name, server.ID, true, true)
+	})
+	checkFirewallRules()
 
 	// test stopping and starting containers when whalewall is running
 	// and when it is stopped and started after
@@ -180,6 +238,116 @@ func TestIntegration(t *testing.T) {
 			checkFirewallRules()
 		})
 	}
+}
+
+func waitForIntegrationState(t *testing.T, timeout time.Duration, description string, check func() error) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		lastErr = check()
+		if lastErr == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s: %v", description, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func checkReplacementPolicy(serverAddr netip.Addr, clientChainName, oldChainName, oldID, newChainName, newID string, requireOldGone, requireReady bool) error {
+	nfc, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("create nftables client: %w", err)
+	}
+
+	set, err := nfc.GetSetByName(filterTable, containerAddrSetName)
+	if err != nil {
+		return fmt.Errorf("get container address set: %w", err)
+	}
+	elements, err := nfc.GetSetElements(set)
+	if err != nil {
+		return fmt.Errorf("get container address mappings: %w", err)
+	}
+	serverKey := serverAddr.AsSlice()
+	var mappedChain string
+	for _, element := range elements {
+		if !bytes.Equal(element.Key, serverKey) {
+			continue
+		}
+		verdict, err := containerMappingVerdict(element)
+		if err != nil {
+			return fmt.Errorf("decode server address mapping: %w", err)
+		}
+		mappedChain = verdict.Chain
+		break
+	}
+	if mappedChain != newChainName {
+		return fmt.Errorf("server address %s maps to %q, want %q", serverAddr, mappedChain, newChainName)
+	}
+
+	chains, err := nfc.ListChains()
+	if err != nil {
+		return fmt.Errorf("list nftables chains: %w", err)
+	}
+	ownedChains := make(map[string]*nftables.Chain)
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Table.Family != nftables.TableFamilyIPv4 || chain.Table.Name != filterTableName {
+			continue
+		}
+		if chain.Name == whalewallChainName || strings.HasPrefix(chain.Name, chainPrefix) {
+			ownedChains[chain.Name] = chain
+		}
+	}
+	newChain := ownedChains[newChainName]
+	if newChain == nil {
+		return fmt.Errorf("replacement chain %q does not exist", newChainName)
+	}
+	if ownedChains[clientChainName] == nil {
+		return fmt.Errorf("client chain %q does not exist", clientChainName)
+	}
+
+	oldChain := ownedChains[oldChainName]
+	if requireOldGone && oldChain != nil {
+		return fmt.Errorf("displaced chain %q still exists", oldChainName)
+	}
+
+	var newChainHasDrop, clientHasNewPeerRule bool
+	for chainName, chain := range ownedChains {
+		rules, err := nfc.GetRules(chain.Table, chain)
+		if err != nil {
+			return fmt.Errorf("get rules from owned chain %q: %w", chainName, err)
+		}
+
+		if chainName == oldChainName {
+			if len(rules) != 1 || !rulesEqual(zap.NewNop(), rules[0], createDropRule(chain, oldID)) {
+				return fmt.Errorf("displaced chain %q is not reduced to its canonical drop rule", oldChainName)
+			}
+			continue
+		}
+
+		for _, rule := range rules {
+			if string(rule.UserData) == oldID {
+				return fmt.Errorf("owned chain %q retains a rule for displaced ID %s", chainName, oldID)
+			}
+			if chainName == clientChainName && string(rule.UserData) == newID {
+				clientHasNewPeerRule = true
+			}
+			if chainName == newChainName && rulesEqual(zap.NewNop(), rule, createDropRule(chain, newID)) {
+				newChainHasDrop = true
+			}
+		}
+	}
+	if !newChainHasDrop {
+		return fmt.Errorf("replacement chain %q has no canonical drop rule", newChainName)
+	}
+	if requireReady && !clientHasNewPeerRule {
+		return fmt.Errorf("client chain %q has no peer rule owned by replacement ID %s", clientChainName, newID)
+	}
+
+	return nil
 }
 
 func startWhalewall(t *testing.T, is *is.I, tempDir string) func() {
@@ -285,18 +453,12 @@ func startFunc(t *testing.T, is *is.I, tempDir string) func() {
 func portOpen(t *testing.T, container, host string, port uint16, udp bool) bool {
 	t.Helper()
 
-	var udpFlag string
+	scanType := "-sT"
+	protocol := "tcp"
 	if udp {
-		udpFlag = "-sU"
+		scanType = "-sU"
+		protocol = "udp"
 	}
-	// use nmap to determine if port is open and grep for "open" not "open|filtered"
-	nmapCmd := fmt.Sprintf(`nmap -n -p %d %s %s 2>&1 | egrep "open\s"`, port, udpFlag, host)
-
-	return runCmd(t, container, nmapCmd) == 0
-}
-
-func runCmd(t *testing.T, container, command string) int {
-	t.Helper()
 
 	args := []string{
 		"docker",
@@ -305,6 +467,109 @@ func runCmd(t *testing.T, container, command string) int {
 		"exec",
 		"-T",
 		container,
+		"nmap",
+		"-4",
+		"-n",
+		"-Pn",
+		scanType,
+		"-p",
+		strconv.FormatUint(uint64(port), 10),
+		"-oG",
+		"-",
+		host,
+	}
+	t.Logf("running %v", args)
+
+	output, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("nmap probe failed: %v\n%s", err, output)
+	}
+
+	state, err := parseNmapPortState(string(output), port, protocol)
+	if err != nil {
+		t.Fatalf("could not parse nmap probe output: %v\n%s", err, output)
+	}
+
+	return state == nmapPortOpen
+}
+
+type nmapPortState uint8
+
+const (
+	nmapPortInvalid nmapPortState = iota
+	nmapPortNotOpen
+	nmapPortOpen
+)
+
+func parseNmapPortState(output string, port uint16, protocol string) (nmapPortState, error) {
+	portPattern := regexp.MustCompile(fmt.Sprintf(`(?:^|[\t ,])%d/([^/]+)/%s/`, port, protocol))
+	matches := portPattern.FindAllStringSubmatch(output, -1)
+	if len(matches) != 1 {
+		return nmapPortInvalid, fmt.Errorf(
+			"expected exactly one result for %d/%s, found %d",
+			port,
+			protocol,
+			len(matches),
+		)
+	}
+
+	switch matches[0][1] {
+	case "open":
+		return nmapPortOpen, nil
+	case "filtered", "open|filtered":
+		return nmapPortNotOpen, nil
+	case "closed", "closed|filtered":
+		return nmapPortInvalid, fmt.Errorf(
+			"port %d/%s is %s; the listener is not proven live, so this cannot validate a firewall denial",
+			port,
+			protocol,
+			matches[0][1],
+		)
+	default:
+		return nmapPortInvalid, fmt.Errorf("unexpected state %q for %d/%s", matches[0][1], port, protocol)
+	}
+}
+
+func TestParseNmapPortState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		state   string
+		want    nmapPortState
+		wantErr bool
+	}{
+		{state: "open", want: nmapPortOpen},
+		{state: "filtered", want: nmapPortNotOpen},
+		{state: "open|filtered", want: nmapPortNotOpen},
+		{state: "closed", want: nmapPortInvalid, wantErr: true},
+		{state: "closed|filtered", want: nmapPortInvalid, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			t.Parallel()
+
+			output := fmt.Sprintf("Host: 127.0.0.1 ()\tPorts: 756/%s/udp//unknown///\n", tt.state)
+			got, err := parseNmapPortState(output, 756, "udp")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseNmapPortState() error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("parseNmapPortState() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func runClientCmd(t *testing.T, command string) int {
+	t.Helper()
+
+	args := []string{
+		"docker",
+		"compose",
+		"-f=testdata/docker-compose.yml",
+		"exec",
+		"-T",
+		"client",
 		"sh",
 		"-c",
 		command,
@@ -333,7 +598,7 @@ func run(t *testing.T, args ...string) int {
 	return 0
 }
 
-func getContainerChain(name string, containers []types.Container) *nftables.Chain {
+func getContainerChain(name string, containers []container.Summary) *nftables.Chain {
 	for _, container := range containers {
 		if slices.ContainsFunc(container.Names, func(n string) bool {
 			return stripName(n) == name
@@ -355,8 +620,8 @@ func chainExists(name string, chains []*nftables.Chain) bool {
 }
 
 var (
-	cont1ID     = "container_one_ID"
-	cont2ID     = "container_two_ID"
+	cont1ID     = "1111111111111111111111111111111111111111111111111111111111111111"
+	cont2ID     = "2222222222222222222222222222222222222222222222222222222222222222"
 	cont1Name   = "container1"
 	cont2Name   = "container2"
 	gatewayAddr = netip.MustParseAddr("172.0.1.1")
@@ -373,28 +638,26 @@ func TestRuleCreation(t *testing.T) {
 
 	type ruleCreationTest struct {
 		name          string
-		containers    []types.ContainerJSON
+		containers    []container.InspectResponse
 		expectedRules map[*nftables.Chain][]*nftables.Rule
 	}
 	tests := []ruleCreationTest{
 		{
 			name: "deny all",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -417,12 +680,10 @@ func TestRuleCreation(t *testing.T) {
 		},
 		{
 			name: "allow HTTPS outbound",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -433,11 +694,11 @@ output:
       - 443`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -456,7 +717,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -469,7 +730,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -486,12 +747,10 @@ output:
 		},
 		{
 			name: "allow HTTP, HTTPS outbound",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -503,11 +762,11 @@ output:
       - 443`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -531,7 +790,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -549,7 +808,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -566,12 +825,10 @@ output:
 		},
 		{
 			name: "allow HTTP and range outbound",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -583,11 +840,11 @@ output:
       - 420-9001`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -610,7 +867,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -627,7 +884,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -644,12 +901,10 @@ output:
 		},
 		{
 			name: "allow HTTPS outbound to 1.1.1.1",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -662,11 +917,11 @@ output:
       - 443`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -686,7 +941,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -700,7 +955,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -717,12 +972,10 @@ output:
 		},
 		{
 			name: "allow DNS outbound to 192.168.1.0/24",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -735,11 +988,11 @@ output:
       - 53`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -759,7 +1012,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -773,7 +1026,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -790,12 +1043,10 @@ output:
 		},
 		{
 			name: "allow DNS outbound to 2 IPs",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -809,11 +1060,11 @@ output:
       - 53`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -838,7 +1089,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -857,7 +1108,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -874,12 +1125,10 @@ output:
 		},
 		{
 			name: "allow DNS outbound to mixed IPs",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -893,11 +1142,11 @@ output:
       - 53`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -921,7 +1170,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -939,7 +1188,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -956,12 +1205,10 @@ output:
 		},
 		{
 			name: "allow outbound from one source port",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -974,11 +1221,11 @@ output:
       - 100-200`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1001,7 +1248,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1018,7 +1265,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1035,12 +1282,10 @@ output:
 		},
 		{
 			name: "verdict with log prefix",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1052,11 +1297,11 @@ output:
       - 443`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1076,7 +1321,7 @@ output:
 							[]expr.Any{
 								&expr.Counter{},
 								logExpr(formatLogPrefix("logger pfx", cont1Name, cont1ID)),
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1089,7 +1334,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1102,7 +1347,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1119,12 +1364,10 @@ output:
 		},
 		{
 			name: "verdict with queue",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1137,11 +1380,11 @@ output:
       queue: 1000`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1175,7 +1418,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1188,7 +1431,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1205,12 +1448,10 @@ output:
 		},
 		{
 			name: "verdict with queue and est queues",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1225,11 +1466,11 @@ output:
       output_est_queue: 1002`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1297,12 +1538,10 @@ output:
 		},
 		{
 			name: "verdict with queue and same output est queue",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1317,11 +1556,11 @@ output:
       output_est_queue: 1000`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1374,12 +1613,10 @@ output:
 		},
 		{
 			name: "allow access to container",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1392,30 +1629,28 @@ output:
       - 9001`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
 				},
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont2ID,
-						Name: "/" + cont2Name,
-					},
+					ID:   cont2ID,
+					Name: "/" + cont2Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont2Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont2Addr,
 							},
 						},
 					},
@@ -1435,7 +1670,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont2ID),
@@ -1461,7 +1696,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1478,12 +1713,10 @@ output:
 		},
 		{
 			name: "allow access to container with one source port",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1498,30 +1731,28 @@ output:
       - 9001`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
 				},
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont2ID,
-						Name: "/" + cont2Name,
-					},
+					ID:   cont2ID,
+					Name: "/" + cont2Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont2Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont2Addr,
 							},
 						},
 					},
@@ -1542,7 +1773,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont2ID),
@@ -1569,7 +1800,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1586,12 +1817,10 @@ output:
 		},
 		{
 			name: "allow containers to access each other",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1604,20 +1833,18 @@ output:
       - 202`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
 				},
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont2ID,
-						Name: "/" + cont2Name,
-					},
+					ID:   cont2ID,
+					Name: "/" + cont2Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1630,11 +1857,11 @@ output:
       - 101`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
+					NetworkSettings: &container.NetworkSettings{
 						Networks: map[string]*network.EndpointSettings{
 							"cont_net": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont2Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont2Addr,
 							},
 						},
 					},
@@ -1654,7 +1881,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont2ID),
@@ -1668,7 +1895,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont2ID),
@@ -1694,7 +1921,7 @@ output:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1708,7 +1935,7 @@ output:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1725,12 +1952,10 @@ output:
 		},
 		{
 			name: "allow external access to mapped ports",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1740,35 +1965,25 @@ mapped_ports:
     allow: true`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
-						NetworkSettingsBase: types.NetworkSettingsBase{
-							Ports: nat.PortMap{
-								"80/tcp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "80",
-									},
-									{
-										HostIP:   "::",
-										HostPort: "80",
-									},
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("80/tcp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "80",
 								},
-								"53/udp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "5533",
-									},
-									{
-										HostIP:   "::",
-										HostPort: "5533",
-									},
+							},
+							network.MustParsePort("53/udp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "5533",
 								},
 							},
 						},
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1831,7 +2046,7 @@ mapped_ports:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1844,7 +2059,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1871,7 +2086,7 @@ mapped_ports:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1884,7 +2099,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1902,12 +2117,10 @@ mapped_ports:
 
 		{
 			name: "allow access from 192.168.1.0/24 to mapped ports",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -1919,35 +2132,25 @@ mapped_ports:
       - 192.168.1.0/24`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
-						NetworkSettingsBase: types.NetworkSettingsBase{
-							Ports: nat.PortMap{
-								"80/tcp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "8080",
-									},
-									{
-										HostIP:   "::",
-										HostPort: "8080",
-									},
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("80/tcp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "8080",
 								},
-								"53/udp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "5533",
-									},
-									{
-										HostIP:   "::",
-										HostPort: "5533",
-									},
+							},
+							network.MustParsePort("53/udp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "5533",
 								},
 							},
 						},
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -1981,7 +2184,7 @@ mapped_ports:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -1995,7 +2198,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2023,7 +2226,7 @@ mapped_ports:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2037,7 +2240,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2054,12 +2257,10 @@ mapped_ports:
 		},
 		{
 			name: "allow localhost access to mapped ports",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -2069,21 +2270,19 @@ mapped_ports:
     allow: true`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
-						NetworkSettingsBase: types.NetworkSettingsBase{
-							Ports: nat.PortMap{
-								"443/udp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "8443",
-									},
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("443/udp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "8443",
 								},
 							},
 						},
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -2103,7 +2302,7 @@ mapped_ports:
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2117,7 +2316,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2134,12 +2333,10 @@ mapped_ports:
 		},
 		{
 			name: "allow localhost access to mapped ports with queue",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -2151,21 +2348,19 @@ mapped_ports:
       queue: 1000`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
-						NetworkSettingsBase: types.NetworkSettingsBase{
-							Ports: nat.PortMap{
-								"443/udp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "8443",
-									},
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("443/udp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "8443",
 								},
 							},
 						},
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -2201,7 +2396,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2215,7 +2410,7 @@ mapped_ports:
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
-								acceptVerdict,
+								allowReturnVerdict,
 							},
 						),
 						UserData: []byte(cont1ID),
@@ -2232,12 +2427,10 @@ mapped_ports:
 		},
 		{
 			name: "allow localhost access to mapped ports with same input est queue",
-			containers: []types.ContainerJSON{
+			containers: []container.InspectResponse{
 				{
-					ContainerJSONBase: &types.ContainerJSONBase{
-						ID:   cont1ID,
-						Name: "/" + cont1Name,
-					},
+					ID:   cont1ID,
+					Name: "/" + cont1Name,
 					Config: &container.Config{
 						Labels: map[string]string{
 							enabledLabel: "true",
@@ -2251,21 +2444,19 @@ mapped_ports:
       output_est_queue: 1001`,
 						},
 					},
-					NetworkSettings: &types.NetworkSettings{
-						NetworkSettingsBase: types.NetworkSettingsBase{
-							Ports: nat.PortMap{
-								"443/udp": []nat.PortBinding{
-									{
-										HostIP:   "0.0.0.0",
-										HostPort: "8443",
-									},
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("443/udp"): []network.PortBinding{
+								{
+									HostIP:   netip.MustParseAddr("0.0.0.0"),
+									HostPort: "8443",
 								},
 							},
 						},
 						Networks: map[string]*network.EndpointSettings{
 							"default": {
-								Gateway:   gatewayAddr.String(),
-								IPAddress: cont1Addr.String(),
+								Gateway:   gatewayAddr,
+								IPAddress: cont1Addr,
 							},
 						},
 					},
@@ -2352,13 +2543,7 @@ mapped_ports:
 			// DOCKER-USER chain
 			firewallCreator := newMockFirewallCreator(logger)
 			mfc := firewallCreator.newMockFirewall()
-			mfc.AddTable(filterTable)
-			mfc.AddChain(&nftables.Chain{
-				Name:  dockerChainName,
-				Table: filterTable,
-				Type:  nftables.ChainTypeFilter,
-			})
-			is.NoErr(mfc.Flush())
+			addMockDockerPrerequisites(t, mfc)
 			r.newFirewallClient = func() (firewallClient, error) {
 				return firewallCreator.newMockFirewall(), nil
 			}
@@ -2416,7 +2601,7 @@ mapped_ports:
 
 				is.NoErr(mfc.Flush())
 				is.True(len(mfc.tables[filterTableName].Sets) == 0)
-				chains := maps.Values(mfc.chains)
+				chains := slices.Collect(maps.Values(mfc.chains))
 				slices.SortFunc(chains, func(a, b chain) int {
 					if a.Chain.Name == b.Chain.Name {
 						return 0
@@ -2425,10 +2610,11 @@ mapped_ports:
 					}
 					return 1
 				})
-				is.True(len(chains) == 3)
+				is.True(len(chains) == 4)
 				is.True(chains[0].Chain.Name == dockerChainName)
-				is.True(chains[1].Chain.Name == inputChainName)
-				is.True(chains[2].Chain.Name == outputChainName)
+				is.True(chains[1].Chain.Name == forwardChainName)
+				is.True(chains[2].Chain.Name == inputChainName)
+				is.True(chains[3].Chain.Name == outputChainName)
 			} else {
 				// check that deleting container rules removes all rules
 				// of that container
@@ -2451,8 +2637,6 @@ mapped_ports:
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		for chain, rules := range tt.expectedRules {
 			for i := range rules {
 				// set rule's table here so we don't have to in test
@@ -2499,12 +2683,10 @@ mapped_ports:
 func TestDeletingContainers(t *testing.T) {
 	t.Parallel()
 
-	containers := []types.ContainerJSON{
+	containers := []container.InspectResponse{
 		{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				ID:   cont1ID,
-				Name: "/" + cont1Name,
-			},
+			ID:   cont1ID,
+			Name: "/" + cont1Name,
 			Config: &container.Config{
 				Labels: map[string]string{
 					enabledLabel: "true",
@@ -2520,30 +2702,28 @@ output:
   dst_ports: [202]`,
 				},
 			},
-			NetworkSettings: &types.NetworkSettings{
+			NetworkSettings: &container.NetworkSettings{
 				Networks: map[string]*network.EndpointSettings{
 					"cont_net": {
-						Gateway:   gatewayAddr.String(),
-						IPAddress: cont1Addr.String(),
+						Gateway:   gatewayAddr,
+						IPAddress: cont1Addr,
 					},
 				},
 			},
 		},
 		{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				ID:   cont2ID,
-				Name: "/" + cont2Name,
-			},
+			ID:   cont2ID,
+			Name: "/" + cont2Name,
 			Config: &container.Config{
 				Labels: map[string]string{
 					enabledLabel: "true",
 				},
 			},
-			NetworkSettings: &types.NetworkSettings{
+			NetworkSettings: &container.NetworkSettings{
 				Networks: map[string]*network.EndpointSettings{
 					"cont_net": {
-						Gateway:   gatewayAddr.String(),
-						IPAddress: cont2Addr.String(),
+						Gateway:   gatewayAddr,
+						IPAddress: cont2Addr,
 					},
 				},
 			},
@@ -2571,13 +2751,7 @@ output:
 	// DOCKER-USER chain
 	firewallCreator := newMockFirewallCreator(logger)
 	mfc := firewallCreator.newMockFirewall()
-	mfc.AddTable(filterTable)
-	mfc.AddChain(&nftables.Chain{
-		Name:  dockerChainName,
-		Table: filterTable,
-		Type:  nftables.ChainTypeFilter,
-	})
-	is.NoErr(mfc.Flush())
+	addMockDockerPrerequisites(t, mfc)
 	r.newFirewallClient = func() (firewallClient, error) {
 		return firewallCreator.newMockFirewall(), nil
 	}
@@ -2644,31 +2818,27 @@ output:
 func TestCreationIdempotency(t *testing.T) {
 	t.Parallel()
 
-	containers := []types.ContainerJSON{
+	containers := []container.InspectResponse{
 		{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				ID:   cont2ID,
-				Name: "/" + cont2Name,
-			},
+			ID:   cont2ID,
+			Name: "/" + cont2Name,
 			Config: &container.Config{
 				Labels: map[string]string{
 					enabledLabel: "true",
 				},
 			},
-			NetworkSettings: &types.NetworkSettings{
+			NetworkSettings: &container.NetworkSettings{
 				Networks: map[string]*network.EndpointSettings{
 					"cont_net": {
-						Gateway:   gatewayAddr.String(),
-						IPAddress: cont2Addr.String(),
+						Gateway:   gatewayAddr,
+						IPAddress: cont2Addr,
 					},
 				},
 			},
 		},
 		{
-			ContainerJSONBase: &types.ContainerJSONBase{
-				ID:   cont1ID,
-				Name: "/" + cont1Name,
-			},
+			ID:   cont1ID,
+			Name: "/" + cont1Name,
 			Config: &container.Config{
 				Labels: map[string]string{
 					enabledLabel: "true",
@@ -2681,11 +2851,11 @@ output:
       - 9001`,
 				},
 			},
-			NetworkSettings: &types.NetworkSettings{
+			NetworkSettings: &container.NetworkSettings{
 				Networks: map[string]*network.EndpointSettings{
 					"cont_net": {
-						Gateway:   gatewayAddr.String(),
-						IPAddress: cont1Addr.String(),
+						Gateway:   gatewayAddr,
+						IPAddress: cont1Addr,
 					},
 				},
 			},
@@ -2713,13 +2883,7 @@ output:
 	// DOCKER-USER chain
 	firewallCreator := newMockFirewallCreator(logger)
 	mfc := firewallCreator.newMockFirewall()
-	mfc.AddTable(filterTable)
-	mfc.AddChain(&nftables.Chain{
-		Name:  dockerChainName,
-		Table: filterTable,
-		Type:  nftables.ChainTypeFilter,
-	})
-	is.NoErr(mfc.Flush())
+	addMockDockerPrerequisites(t, mfc)
 	r.newFirewallClient = func() (firewallClient, error) {
 		return firewallCreator.newMockFirewall(), nil
 	}
@@ -2804,14 +2968,13 @@ func (t *txOnCommit) Commit() error {
 	return t.onCommit(t.TX)
 }
 
+//nolint:tparallel // The cancellation subtests share one manager and transaction barrier.
 func TestCancelingCreation(t *testing.T) {
 	t.Parallel()
 
-	container := types.ContainerJSON{
-		ContainerJSONBase: &types.ContainerJSONBase{
-			ID:   cont1ID,
-			Name: "/" + cont1Name,
-		},
+	cont := container.InspectResponse{
+		ID:   cont1ID,
+		Name: "/" + cont1Name,
 		Config: &container.Config{
 			Labels: map[string]string{
 				enabledLabel: "true",
@@ -2823,11 +2986,11 @@ output:
   dst_ports: [443]`,
 			},
 		},
-		NetworkSettings: &types.NetworkSettings{
+		NetworkSettings: &container.NetworkSettings{
 			Networks: map[string]*network.EndpointSettings{
 				"cont_net": {
-					Gateway:   gatewayAddr.String(),
-					IPAddress: cont1Addr.String(),
+					Gateway:   gatewayAddr,
+					IPAddress: cont1Addr,
 				},
 			},
 		},
@@ -2855,7 +3018,7 @@ output:
 	}
 
 	dockerCli := newMockDockerClient(nil)
-	dockerCli.containers = []types.ContainerJSON{container}
+	dockerCli.containers = []container.InspectResponse{cont}
 	r.newDockerClient = func() (dockerClient, error) {
 		return dockerCli, nil
 	}
@@ -2864,13 +3027,7 @@ output:
 	// DOCKER-USER chain
 	firewallCreator := newMockFirewallCreator(logger)
 	mfc := firewallCreator.newMockFirewall()
-	mfc.AddTable(filterTable)
-	mfc.AddChain(&nftables.Chain{
-		Name:  dockerChainName,
-		Table: filterTable,
-		Type:  nftables.ChainTypeFilter,
-	})
-	is.NoErr(mfc.Flush())
+	addMockDockerPrerequisites(t, mfc)
 	r.newFirewallClient = func() (firewallClient, error) {
 		return firewallCreator.newMockFirewall(), nil
 	}
@@ -2891,7 +3048,7 @@ output:
 
 		// create rules
 		go func() {
-			err = r.createContainerRules(ctx, container, true)
+			err = r.createContainerRules(ctx, cont, true)
 			is.True(errors.Is(err, context.Canceled))
 			done <- struct{}{}
 		}()
@@ -2926,7 +3083,7 @@ output:
 
 		// create rules
 		go func() {
-			err = r.createContainerRules(ctx, container, true)
+			err = r.createContainerRules(ctx, cont, true)
 			is.True(errors.Is(err, context.Canceled))
 			done <- struct{}{}
 		}()

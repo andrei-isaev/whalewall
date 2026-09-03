@@ -46,6 +46,15 @@ type ruleConfig struct {
 	DstPorts  []rulePorts `yaml:"dst_ports"`
 	Verdict   verdict
 
+	// Persisted routing identity for waiting rules. These fields are excluded
+	// from user YAML but exported so gob records cannot later resolve a shared
+	// Compose service alias to a different project/container.
+	ResolvedContainerID   string `yaml:"-"`
+	ResolvedContainerName string `yaml:"-"`
+	SourceProject         string `yaml:"-"`
+	NetworkID             string `yaml:"-"`
+	IdentityVersion       uint8  `yaml:"-"`
+
 	skip bool
 }
 
@@ -140,16 +149,35 @@ func (a addrOrRange) MarshalBinary() ([]byte, error) {
 func (a *addrOrRange) UnmarshalText(text []byte) error {
 	if bytes.ContainsRune(text, '/') {
 		prefix := new(netip.Prefix)
-		err := prefix.UnmarshalText(text)
-		if err != nil {
+		if err := prefix.UnmarshalText(text); err != nil {
 			return err
 		}
-		a.addrRange = netipx.RangeOfPrefix(*prefix)
+		if !prefix.Addr().Is4() {
+			return fmt.Errorf("IPv6 address %q is not supported", text)
+		}
+		*a = addrOrRange{addrRange: netipx.RangeOfPrefix(*prefix)}
 		return nil
 	} else if bytes.ContainsRune(text, '-') {
-		return a.addrRange.UnmarshalText(text)
+		var addrRange netipx.IPRange
+		if err := addrRange.UnmarshalText(text); err != nil {
+			return err
+		}
+		if !addrRange.From().Is4() || !addrRange.To().Is4() {
+			return fmt.Errorf("IPv6 address range %q is not supported", text)
+		}
+		*a = addrOrRange{addrRange: addrRange}
+		return nil
 	}
-	return a.addr.UnmarshalText(text)
+
+	var addr netip.Addr
+	if err := addr.UnmarshalText(text); err != nil {
+		return err
+	}
+	if !addr.Is4() {
+		return fmt.Errorf("IPv6 address %q is not supported", text)
+	}
+	*a = addrOrRange{addr: addr}
+	return nil
 }
 
 func (a *addrOrRange) UnmarshalBinary(data []byte) error {
@@ -257,15 +285,22 @@ func (p rulePorts) MarshalBinary() ([]byte, error) {
 }
 
 func (p *rulePorts) UnmarshalText(text []byte) error {
-	var intervalIdx int
+	if len(text) == 0 {
+		return errors.New("port cannot be empty")
+	}
+
+	intervalIdx := -1
 	validChars := []byte{'1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-'}
 	for i, char := range text {
 		if !slices.Contains(validChars, char) {
 			return fmt.Errorf("invalid character %q in port", char)
 		}
 		if char == '-' {
-			if intervalIdx != 0 {
+			if intervalIdx >= 0 {
 				return errors.New("there can only be one '-' if specifying a port interval")
+			}
+			if i == 0 {
+				return errors.New("port interval can't start with a '-'")
 			}
 			if i == len(text)-1 {
 				return errors.New("port interval can't end with a '-'")
@@ -275,7 +310,7 @@ func (p *rulePorts) UnmarshalText(text []byte) error {
 	}
 
 	var parsedPorts rulePorts
-	if intervalIdx != 0 {
+	if intervalIdx >= 0 {
 		intervalMin, err := strconv.ParseUint(string(text[:intervalIdx]), 10, 16)
 		if err != nil {
 			return fmt.Errorf("error parsing start of port interval: %w", err)
@@ -283,6 +318,12 @@ func (p *rulePorts) UnmarshalText(text []byte) error {
 		intervalMax, err := strconv.ParseUint(string(text[intervalIdx+1:]), 10, 16)
 		if err != nil {
 			return fmt.Errorf("error parsing end of port interval: %w", err)
+		}
+		if intervalMin == 0 || intervalMax == 0 {
+			return errors.New("port interval values must be between 1 and 65535")
+		}
+		if intervalMin > intervalMax {
+			return errors.New("port interval start must not be greater than its end")
 		}
 		parsedPorts.interval = portInterval{
 			min: uint16(intervalMin),
@@ -292,6 +333,9 @@ func (p *rulePorts) UnmarshalText(text []byte) error {
 		port, err := strconv.ParseUint(string(text), 10, 16)
 		if err != nil {
 			return fmt.Errorf("error parsing port: %w", err)
+		}
+		if port == 0 {
+			return errors.New("port must be between 1 and 65535")
 		}
 		parsedPorts.single = uint16(port)
 	}
@@ -312,6 +356,13 @@ func (p rulePorts) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 }
 
 func validateConfig(c config) error {
+	if err := validateVerdict(c.MappedPorts.Localhost.Verdict); err != nil {
+		return fmt.Errorf("mapped_ports.localhost verdict: %w", err)
+	}
+	if err := validateVerdict(c.MappedPorts.External.Verdict); err != nil {
+		return fmt.Errorf("mapped_ports.external verdict: %w", err)
+	}
+
 	for i, r := range c.Output {
 		err := validateRule(r)
 		if err != nil {
@@ -327,7 +378,7 @@ func validateRule(r ruleConfig) error {
 		return errors.New("rule is empty")
 	}
 	if len(r.IPs) != 0 && r.Container != "" {
-		return errors.New(`"ip" and "container" are mutually exclusive`)
+		return errors.New(`"ips" and "container" are mutually exclusive`)
 	}
 
 	if r.Network == "" && r.Container != "" {
@@ -348,20 +399,11 @@ func validateRule(r ruleConfig) error {
 }
 
 func validateVerdict(v verdict) error {
-	if v.Chain != "" && v.Queue != 0 {
-		return errors.New(`"chain" and "queue" are mutually exclusive`)
+	if v.Chain != "" {
+		return errors.New(`"chain" verdicts are unsupported in this hardened build because they can bypass downstream Docker isolation`)
 	}
-	if v.Queue == 0 && v.InputEstQueue != 0 {
-		return errors.New(`"queue" must be set when "input_est_queue" is set`)
-	}
-	if v.Queue == 0 && v.OutputEstQueue != 0 {
-		return errors.New(`"queue" must be set when "output_est_queue" is set`)
-	}
-	if v.InputEstQueue == 0 && v.OutputEstQueue != 0 {
-		return errors.New(`"input_est_queue" must be set when "output_est_queue" is set`)
-	}
-	if v.OutputEstQueue == 0 && v.InputEstQueue != 0 {
-		return errors.New(`"output_est_queue" must be set when "input_est_queue" is set`)
+	if v.Queue != 0 || v.InputEstQueue != 0 || v.OutputEstQueue != 0 {
+		return errors.New(`"queue" verdicts are unsupported in this hardened build because NF_ACCEPT can bypass downstream Docker isolation`)
 	}
 
 	return nil

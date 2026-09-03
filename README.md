@@ -4,7 +4,58 @@ Automate management of firewall rules for Docker containers.
 
 ## Requirements
 
-Linux with a recent kernel, around 5.10 or newer.
+This fork intentionally supports a narrow deployment profile:
+
+- Linux with a recent kernel (5.13 or newer is recommended for Landlock support)
+- `linux/amd64` for the reviewed binary and container build path
+- rootful Docker Engine using the `iptables` firewall backend
+- the nftables-backed iptables implementation (`iptables-nft`), not `iptables-legacy`
+- IPv4 Docker networks only
+- bridge traffic passed through netfilter
+
+Docker Engine 29's native `nftables` firewall backend is **not** supported. It does not create the
+`ip filter DOCKER-USER` chain that whalewall currently integrates with. Rootless Docker, Docker
+Swarm, macvlan networks, host-networked managed containers, and IPv6 are also unsupported.
+
+Check the host before deploying:
+
+```sh
+docker info | grep 'Firewall Backend'
+command -v iptables >/dev/null && sudo iptables --version || true
+sudo nft list chain ip filter DOCKER-USER
+cat /proc/sys/net/bridge/bridge-nf-call-iptables
+```
+
+The required results are `Firewall Backend: iptables`, an existing nftables `DOCKER-USER` chain, and
+a bridge netfilter value of `1`. If the optional `iptables` CLI is installed, it should report
+`(nf_tables)`, not `legacy`. The executable itself is not required by whalewall; whalewall programs
+nftables through netlink rather than invoking it.
+
+On hosts where bridge filtering is not already enabled, load and persist it before starting
+whalewall:
+
+```sh
+sudo modprobe br_netfilter
+printf '%s\n' br_netfilter | sudo tee /etc/modules-load.d/br_netfilter.conf
+printf '%s\n' 'net.bridge.bridge-nf-call-iptables = 1' |
+  sudo tee /etc/sysctl.d/99-docker-bridge-filter.conf
+sudo sysctl --system
+```
+
+If `/etc/docker/daemon.json` is used, keep Docker on the supported backend by merging this setting
+with the existing JSON (do not overwrite unrelated daemon settings):
+
+```json
+{
+  "firewall-backend": "iptables"
+}
+```
+
+Validate daemon configuration before a maintenance-window restart:
+
+```sh
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+```
 
 ## Purpose
 
@@ -46,24 +97,56 @@ containers to what was last saved to the database and create/delete firewall rul
 ## Security
 
 Whalewall needs the `NET_ADMIN` capability to manage nftables rules. It also needs to be a member
-of the `docker` group in order to use `/var/run/docker/docker.sock` to receive events from the
+of the `docker` group in order to use `/var/run/docker.sock` to receive events from the
 local Docker daemon.
 
-To reduce attack surface, [landlock](https://docs.kernel.org/userspace-api/landlock.html) and
-[seccomp](https://docs.kernel.org/next/userspace-api/seccomp_filter.html) are leveraged to ensure
-only files and syscalls required by whalewall can be accessed and called respectively. This vastly
-limits what whalewall is able to do in the event an attacker is able to execute code in the context
-of its process. However, this will not prevent said attacker from taking advantage of the Docker
-socket whalewall has access to which can trivially lead to privilege escalation.
+To reduce attack surface, [seccomp](https://docs.kernel.org/next/userspace-api/seccomp_filter.html)
+restricts the process to its required syscalls; failure to install the filter is fatal. Filesystem
+confinement with [Landlock](https://docs.kernel.org/userspace-api/landlock.html) is best-effort:
+Linux first provides it in 5.13, and whalewall logs and continues when the kernel does not support
+it. If Landlock is part of your threat model, require a supported kernel/configuration and verify
+the `applied landlock rules` startup log. These controls still cannot prevent code executing in the
+whalewall process from abusing its Docker socket, which can trivially lead to privilege escalation.
+
+Mounting the Docker socket with `:ro` only makes the socket file mount read-only; it does not turn
+the Docker API into a read-only API. Treat whalewall as a host-privileged service. A narrowly
+configured Docker socket proxy reduces API exposure, but does not reduce the authority granted by
+host `NET_ADMIN`.
+
+Whalewall is an IPv4 layer-3/layer-4 policy manager, not a complete hostile-workload isolation
+boundary for containers on the same layer-2 bridge. It identifies a container by its IPv4 address;
+it does not bind that identity to a bridge port, MAC address, or cgroup, and the `ip` table does not
+filter ARP or IPv6. Docker grants `NET_RAW` by default, which permits raw and packet sockets. Drop
+`NET_RAW` from every managed workload that does not need it (prefer `cap_drop: [ALL]` followed by
+only the capabilities the workload actually needs). This materially reduces IP/ARP spoofing risk,
+but it does not turn a shared bridge into a strong security boundary.
+
+Docker also starts and connects containers independently of whalewall. There is an unavoidable
+window between a Docker lifecycle change and whalewall applying or reconciling its rules. Invalid
+opt-in or policy labels are quarantined once processed, but a transient Docker, nftables, or database
+failure must still be treated as a deployment failure. Start and verify whalewall before protected
+services, watch its logs continuously, and test both allowed and forbidden traffic after every
+policy or topology change.
+
+Run exactly one whalewall instance per host. Multiple instances can race while replacing the same
+chains, maps, and SQLite ownership state.
+
+For a strict no-crosstalk boundary between potentially compromised workloads, use a separate
+user-defined bridge for each permitted edge (for example, one Caddy-to-backend bridge per backend)
+in addition to whalewall. Do not attach unrelated services to those bridges. Whalewall is useful
+defence in depth and for controlling layer-3/layer-4 egress; it is not a replacement for that
+topology.
 
 ## Installation
 
 ### Docker image
 
-Download the Docker image:
+Build from a reviewed commit and give the result an immutable tag:
 
 ```sh
-docker pull ghcr.io/capnspacehook/whalewall:0.2.0
+docker build --pull --platform=linux/amd64 \
+  --build-arg VERSION="$(git rev-parse HEAD)" \
+  --tag "whalewall:$(git rev-parse --short=12 HEAD)" .
 ```
 
 Ensure whalewall is given necessary permissions, and that it is using `host` network mode. This
@@ -72,13 +155,17 @@ allows the whalewall container to modify host firewall rules.
 Example Docker compose file:
 
 ```yaml
-version: "3"
 services:
   whalewall:
-    cap_add: 
+    cap_drop:
+      - ALL
+    cap_add:
       - NET_ADMIN
-    image: ghcr.io/capnspacehook/whalewall
+    image: whalewall:<reviewed-commit>
     network_mode: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - whalewall_data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -87,14 +174,35 @@ volumes:
   whalewall_data:
 ```
 
+### First hardened deployment
+
+Do not live-upgrade a running upstream Whalewall installation. Older per-container chains can contain
+absolute `ACCEPT`, custom-chain, or NFQUEUE rules whose semantics are intentionally incompatible with
+this fork.
+
+For the first hardened deployment:
+
+1. Stop the protected workloads.
+2. Stop the old Whalewall process.
+3. Run Whalewall's `-clear` operation using the same data directory as the old process.
+4. Verify the `whalewall` chain, `whalewall-container-addrs` map, and all `whalewall-*` container
+   chains are gone from `ip filter`.
+5. Start the hardened build and verify its base rules and logs.
+6. Start protected workloads one at a time, checking one allowed and one forbidden connection after
+   each start.
+
+If this is a new installation with no existing Whalewall rules or database, start at step 5.
+
 ### Binary install
 
-If you want to run whalewall natively, download a release binary.
-
-Or if you want to compile from source, assuming you have Go 1.19 installed:
+This personal fork does not publish release binaries. Compile the checked-out source with the Go
+version declared in `go.mod` and with cgo disabled. The runtime sandbox and container image are
+audited for Linux on AMD64; other operating systems and architectures are intentionally unsupported:
 
 ```sh
-go install github.com/capnspacehook/whalewall/cmd/whalewall@latest
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -buildmode=pie -trimpath \
+  -ldflags "-s -w -X main.version=$(git rev-parse HEAD)" \
+  -o whalewall ./cmd/whalewall
 ```
 
 After installing whalewall, grant it required permissions by running:
@@ -119,7 +227,87 @@ container has an output rule for this container).
 The contents of the `whalewall.rules` label is a yaml config.
 
 Whalewall creates rules with a default drop policy, meaning any traffic not explicitly allowed will
-be dropped.
+be dropped. A Whalewall allow returns the packet to the remaining Docker and host firewall chains;
+those downstream rules can still deny it. Whalewall does not override Docker bridge isolation.
+
+Configuration is decoded strictly. In particular:
+
+- `output` is a YAML list, so every rule starts with `-`.
+- Use the current `src_ports` and `dst_ports` list fields. The old singular `port` field is rejected.
+- Ports and port-range endpoints must be between 1 and 65535; a range's start cannot exceed its end.
+- IP addresses, CIDRs, and ranges must be IPv4. IPv6 values are rejected rather than partially
+  configuring a policy.
+- Publish host ports on an explicit IPv4 address, for example
+  `0.0.0.0:443:443/tcp` or `127.0.0.1:8080:8080/tcp`. An IPv6 host binding such as `[::]:443:443`
+  is rejected. Also keep Docker and every managed network's IPv6 setting disabled.
+- Custom `verdict.chain` and NFQUEUE verdicts are rejected in this hardened fork. An `ACCEPT` from
+  either path can terminate the host firewall hook before Docker's own bridge-isolation rules run.
+- A broad IP rule such as `0.0.0.0/0` includes RFC1918, host, and Docker address ranges; it does not
+  mean "public Internet only". Prefer named-container rules for peer traffic and explicit
+  destination allowlists or a controlled egress proxy when that distinction matters.
+- `mapped_ports` controls Docker-published host ports. Direct traffic between containers on a bridge
+  network is allowed with an `output` rule that names the destination container. An unmanaged peer
+  on the same bridge can also resemble "external" mapped-port traffic, so every member of a shared
+  protected bridge must be managed or isolated on a separate edge network.
+
+### Reverse proxy isolation
+
+Keep the reverse proxy and backends on an ordinary user-defined bridge network. Do not run the proxy
+with `network_mode: host`. Enable whalewall on the proxy and each protected backend, then allow only
+the proxy's required destination ports. A minimal policy looks like this:
+
+```yaml
+services:
+  caddy:
+    cap_drop:
+      # Docker includes NET_RAW by default. At minimum, remove it from every
+      # workload sharing a protected bridge. Prefer ALL where the image permits.
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "0.0.0.0:80:80/tcp"
+      - "0.0.0.0:443:443/tcp"
+    labels:
+      whalewall.enabled: "true"
+      whalewall.rules: |
+        mapped_ports:
+          external:
+            allow: true
+        output:
+          - network: proxy
+            container: app
+            proto: tcp
+            dst_ports:
+              - 8080
+          # Also enumerate DNS, ACME, authentication, and any other
+          # outbound connections required by this Caddy deployment.
+    networks:
+      - proxy
+
+  app:
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      # No app output rules: deny all app-initiated connections.
+      whalewall.enabled: "true"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    driver: bridge
+    enable_ipv6: false
+```
+
+The proxy's output rule creates the corresponding established-return rule for `app`; do not add a
+broad app-to-proxy rule. Repeat the proxy output entry for each backend and service port. Confirm
+`docker network inspect <actual-network-name> --format '{{.EnableIPv6}}'` prints `false`. Compose
+normally prefixes the network key with its project name. For hostile workloads, replace the shared
+`proxy` network with one bridge per Caddy-to-backend edge so unrelated services do not share a
+layer-2 broadcast domain.
 
 ### Example
 
@@ -170,7 +358,7 @@ services:
             dst_ports:
               - 443
     ports:
-      - "80:8080/tcp"
+      - "0.0.0.0:80:8080/tcp"
 
   miniflux_db:
     environment:
@@ -196,19 +384,6 @@ mapped_ports:
     allow: false
     # optional; log new inbound traffic that this rule will match
     log_prefix: ""
-    # optional; settings that allow you to filter traffic further if desired
-    verdict:
-      # optional; a chain to jump to after matching traffic. This applies to new and established
-      # inbound traffic, and established outbound traffic 
-      chain: ""
-      # optional; the userspace nfqueue to send new outbound packets to
-      queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'output_est_queue' is set
-      input_est_queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'input_est_queue' is set
-      output_est_queue: 0
   # controls traffic from external networks (from any non-loopback network interface)
   external:
     # required; allow external traffic or not
@@ -217,19 +392,6 @@ mapped_ports:
     log_prefix: ""
     # optional; a list of IP addresses, CIDRs, or ranges of IP addresses to allow traffic from
     ips: []
-    # optional; settings that allow you to filter traffic further if desired
-    verdict:
-      # optional; a chain to jump to after matching traffic. This applies to new and established
-      # inbound traffic, and established outbound traffic 
-      chain: ""
-      # optional; the userspace nfqueue to send new outbound packets to
-      queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'output_est_queue' is set
-      input_est_queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'input_est_queue' is set
-      output_est_queue: 0
 # controls traffic from a container to localhost, another container, or the internet
 output:
     # optional; log new outbound traffic that this rule will match
@@ -250,19 +412,6 @@ output:
     # optional; a list of destination ports to allow traffic to. Can be a single port or a
     # range of ports.
     dst_ports: []
-    # optional; settings that allow you to filter traffic further if desired
-    verdict:
-      # optional; a chain to jump to after matching traffic. This applies to new and established
-      # inbound traffic, and established outbound traffic 
-      chain: ""
-      # optional; the userspace nfqueue to send new outbound packets to
-      queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'output_est_queue' is set
-      input_est_queue: 0
-      # optional; the userspace nfqueue to send established inbound packets to. Required if
-      # 'input_est_queue' is set
-      output_est_queue: 0
 ```
 
 Port and IP ranges are inclusive. Examples:
@@ -275,7 +424,8 @@ Port and IP ranges are inclusive. Examples:
 Whalewall accepts several environmental variables that can be used to configure how it connects to a Docker server:
 
 - `DOCKER_HOST` to set the URL to the Docker server.
-- `DOCKER_API_VERSION` to set the version of the Docker API to use, leave empty for latest.
+- `DOCKER_API_VERSION` to force a Docker API version. Leave it unset so negotiation can select API
+  1.49 or newer; older APIs cannot report the firewall backend and are rejected.
 - `DOCKER_CERT_PATH` to specify the directory from which to load the TLS certificates (ca.pem, cert.pem, key.pem).
 - `DOCKER_TLS_VERIFY` to enable or disable TLS verification (off by default).
 
@@ -288,62 +438,44 @@ of the `docker0` network interface, which is often `172.17.0.1`
 - If no Docker networks are explicitly created, use the `default` network when creating container to
 container rules
 
-## Verifying releases
+### Operational verification
 
-Starting from v0.2.0, all Docker images and binary checksum files are signed. You can verify
-images or released binaries to ensure they were not tampered with in transit.
-
-Verifying Docker images or binaries both require [`cosign`](https://github.com/sigstore/cosign).
-
-### Verifying Docker images
-
-Simply check the signature of the image with `cosign`:
+After startup and after every label, Docker, or network change:
 
 ```sh
-cosign verify ghcr.io/capnspacehook/whalewall:<version> | jq
+docker logs whalewall
+sudo nft list chain ip filter DOCKER-USER
+sudo nft list table ip filter
 ```
 
-You can verify the image was built by Github Actions by inspecting the `Issuer` and `Subject` fields of the output.
+Confirm there are no rule-creation errors, then probe at least one explicitly allowed connection and
+one forbidden connection from every protected trust boundary. Re-run those probes after restarting
+Docker, whalewall, the proxy, and one protected backend. A running whalewall process is not by itself
+proof that every enabled container has an active policy.
 
-### Verifying binaries
+## Supply-chain pinning
 
-Download the checksums file, certificate, signature and the archive to the same directory.
+Pin deployments to the digest of an image built from a reviewed commit. A Git tag or mutable image
+tag is useful for humans but is not an immutable deployment identity:
 
-Extract the binary from the archive, verify the checksums file and verify the contents of the binary:
+```yaml
+services:
+  whalewall:
+    image: registry.example/whalewall@sha256:<reviewed-image-digest>
+```
+
+Record the source commit and image digest together in the deployment repository. Rebuild and review
+explicitly when either the Go dependencies or base image changes.
+
+A Git submodule already records an immutable commit (the remote branch cannot silently change the
+gitlink stored by the parent repository). For example, in the deployment repository:
 
 ```sh
-tar xfs whalewall_<version>_linux_amd64.tar.gz
-cosign verify-blob --certificate checksums.txt.crt --signature checksums.txt.sig checksums.txt
-sha256sum -c checksums.txt
+git submodule add https://github.com/andrei-isaev/whalewall.git third_party/whalewall
+git -C third_party/whalewall checkout <reviewed-commit>
+git add .gitmodules third_party/whalewall
+git commit -m 'Pin hardened whalewall'
 ```
 
-### Reproducing released binaries
-
-You can also reproduce the released binaries to verify that they were built from this unmodified
-source code. Verifying binaries requires [`gorepro`](https://github.com/capnspacehook/gorepro).
-
-First, download the release archive and extract it. Clone this repro and go into it.
-
-Install `gorepro` and run it on the extracted release binary. `gorepro` will tell you if reproducing
-the binary was successful. Don't worry about checking out the correct tag or commit, gorepro will
-handle that for you.
-
-If you don't trust `gorepro` you can run it again additionally passing the `-d` flag. This will
-print the commands `gorepro` generated to reproduce the release binary. You can run the printed commands
-and verify for yourself that the reproduced binary is bit for bit identical to the released one.
-
-```sh
-tar fxs whalewall_<version>_linux_amd64.tar.gz
-git clone https://github.com/capnspacehook/whalewall whalewall-src
-cd whalewall-src
-
-# reproduce binary
-go install github.com/capnspacehook/gorepro@latest
-gorepro -b="-ldflags=-s -w -X main.version <version>" ../whalewall
-
-# reproduce by manually running command from gorepro
-BUILD_CMD="$(gorepro -d -b='-ldflags=-s -w -X main.version <version>' ../whalewall)"
-echo "$BUILD_CMD"
-"$BUILD_CMD"
-sha256sum whalewall whalewall.repro
-```
+Build from `third_party/whalewall`, then deploy the resulting image by digest rather than by its
+mutable tag.

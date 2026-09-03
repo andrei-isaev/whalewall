@@ -6,22 +6,49 @@ on:
       - master
     paths:
       - "**.go"
+      - "database/*.sql"
       - "go.mod"
       - "go.sum"
+      - "sqlc.yaml"
       - ".github/workflows/check-generated.yml"
   pull_request:
     branches:
       - "*"
     paths:
       - "**.go"
+      - "database/*.sql"
       - "go.mod"
       - "go.sum"
+      - "sqlc.yaml"
       - ".github/workflows/check-generated.yml"
 
   workflow_dispatch: {}
 
 jobs:
   check-generated:
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-    uses: capnspacehook/go-workflows/.github/workflows/check-generated.yml@master
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify module files are tidy
+        run: go mod tidy -diff
+
+      - name: Install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+
+      - name: Regenerate database code
+        run: sqlc generate
+
+      - name: Verify generated files are current
+        run: test -z "$(git status --porcelain)"

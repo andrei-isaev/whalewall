@@ -5,7 +5,8 @@ VALUES
 	(
 		?,
 		?
-	);
+	)
+ON CONFLICT(id) DO UPDATE SET name = excluded.name;
 
 -- name: AddContainerAddr :exec
 INSERT INTO
@@ -14,7 +15,8 @@ VALUES
 	(
 		?,
 		?
-	);
+	)
+ON CONFLICT(addr) DO UPDATE SET container_id = excluded.container_id;
 
 -- name: AddContainerAlias :exec
 INSERT INTO
@@ -23,7 +25,8 @@ VALUES
 	(
 		?,
 		?
-	);
+	)
+ON CONFLICT(container_id, container_alias) DO NOTHING;
 
 -- name: AddEstContainer :exec
 INSERT INTO
@@ -32,7 +35,8 @@ VALUES
 	(
 		?,
 		?
-	);
+	)
+ON CONFLICT(src_container_id, dst_container_id) DO NOTHING;
 
 -- name: AddWaitingContainerRule :exec
 INSERT INTO
@@ -85,6 +89,12 @@ DELETE FROM
 WHERE
 	src_container_id = ? OR
 	dst_container_id = ?;
+
+-- name: DeleteSourceEstContainers :exec
+DELETE FROM
+	est_containers
+WHERE
+	src_container_id = ?;
 
 -- name: DeleteWaitingContainerRules :exec
 DELETE FROM
