@@ -69,6 +69,7 @@ func TestIntegration(t *testing.T) {
 		is.True(!udpPortOpen(t, "tester", "localhost", 8081, "server", 80))                                       // udp mapped port 8081:80 of server is not allowed from localhost
 		is.True(!tcpPortOpen(t, "tester", "localhost", 9001))                                                     // tcp mapped port 9001:9001 of server is not allowed from localhost
 		is.True(!udpPortOpen(t, "tester", "localhost", 9001, "server", 9001))                                     // udp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(tcpPortOpen(t, "tester", "localhost", 8082))                                                      // mapped port through the unselected gateway network remains unaffected
 	}
 
 	tempDir := t.TempDir()
@@ -368,6 +369,10 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 	if err != nil {
 		return fmt.Errorf("inspect server container: %w", err)
 	}
+	unmanagedPrimaryResult, err := dockerCli.ContainerInspect(ctx, "unmanaged-primary", client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspect unmanaged-primary container: %w", err)
+	}
 
 	type expectedPolicy struct {
 		name      string
@@ -375,13 +380,14 @@ func checkInitialContainerPolicies(dockerCli *client.Client) error {
 		address   netip.Addr
 		chain     *nftables.Chain
 	}
-	policies := make([]expectedPolicy, 0, 2)
+	policies := make([]expectedPolicy, 0, 3)
 	for _, item := range []struct {
 		name      string
 		container container.InspectResponse
 	}{
 		{name: "client", container: clientResult.Container},
 		{name: "server", container: serverResult.Container},
+		{name: "unmanaged-primary", container: unmanagedPrimaryResult.Container},
 	} {
 		if item.container.NetworkSettings == nil {
 			return fmt.Errorf("container %q has no network settings", item.name)

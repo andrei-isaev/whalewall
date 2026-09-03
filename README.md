@@ -278,7 +278,13 @@ Configuration is decoded strictly. In particular:
 - `mapped_ports` controls Docker-published host ports. Direct traffic between containers on a bridge
   network is allowed with an `output` rule that names the destination container. An unmanaged peer
   on the same bridge can also resemble "external" mapped-port traffic, so every member of a shared
-  protected bridge must be managed or isolated on a separate edge network.
+  protected bridge must be managed or isolated on a separate edge network. With an explicit scope,
+  host published-port localhost rules are installed only when Docker's selected IPv4 gateway endpoint
+  is managed; published ports routed through an unmanaged gateway endpoint remain untouched. For the
+  supported IPv4 bridge setup, Docker selects the highest `gw_priority` among IPv4 gateway-capable
+  endpoints and uses the actual network name as a tie-breaker. Set `gw_priority` explicitly when a
+  container publishes ports and joins both managed and unmanaged networks so the intended endpoint
+  is unambiguous to operators.
 
 ### Reverse proxy isolation
 

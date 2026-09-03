@@ -82,6 +82,31 @@ services:
       - "0.0.0.0:9001:9001"
       - "0.0.0.0:9001:9001/udp"
 
+  unmanaged-primary:
+    cap_drop:
+      - ALL
+    container_name: unmanaged-primary
+    command: "80"
+    image: ghcr.io/capnspacehook/eavesdropper:latest@sha256:62595df9318fb43bc491fbe2891945602be004cdfa6019db144d2e35200c72cc
+    labels:
+      whalewall.enabled: true
+      whalewall.managed_networks: default
+      whalewall.rules: |
+        mapped_ports:
+          external:
+            allow: true
+    networks:
+      default:
+        gw_priority: 1
+        ipv4_address: 172.29.203.4
+      monitoring:
+        # Docker publishes through this endpoint, which is intentionally
+        # outside the managed scope and must remain unaffected.
+        gw_priority: 2
+        ipv4_address: 172.29.204.4
+    ports:
+      - "0.0.0.0:8082:80"
+
   tester:
     cap_drop:
       - ALL

@@ -963,6 +963,15 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 	if mappedPortsCfg.External.LogPrefix != "" {
 		mappedPortsCfg.External.LogPrefix = formatLogPrefix(mappedPortsCfg.External.LogPrefix, contName, container.ID)
 	}
+	var primaryNetwork string
+	if explicitScope && !mappedPortsCfg.Localhost.Allow && hasLocalhostPublishedPort(container.NetworkSettings.Ports) {
+		var err error
+		primaryNetwork, err = dockerIPv4GatewayNetworkName(container.NetworkSettings.Networks)
+		if err != nil {
+			return nil, fmt.Errorf("cannot identify Docker's IPv4 gateway endpoint for scoped mapped-port policy: %w", err)
+		}
+	}
+	_, primaryManaged := managedNetworks[primaryNetwork]
 
 	nftRules := make([]*nftables.Rule, 0, len(managedNetworks))
 	managedNetworkNames := slices.Collect(maps.Keys(managedNetworks))
@@ -974,9 +983,6 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 			gateway = netSettings.Gateway
 		} else if mappedPortsCfg.Localhost.Allow {
 			logger.Warn("localhost mapped-port access cannot be enabled on a network without a gateway", zap.String("network.name", netName))
-		}
-		if explicitScope && mappedPortsCfg.External.Allow && !mappedPortsCfg.Localhost.Allow && !gateway.IsValid() {
-			return nil, fmt.Errorf("network %q has no gateway, so scoped mapped-port policy cannot deny localhost while allowing external traffic", netName)
 		}
 
 		// sort mapped ports so rules are created deterministically making
@@ -1059,10 +1065,14 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 					nftRules = append(nftRules, rules...)
 				}
 
-				if !localAllowed && !explicitScope {
+				if !localAllowed && (!explicitScope || (primaryManaged && netName == primaryNetwork)) {
 					// Create rule to drop traffic going to the mapped
 					// host port. This will prevent traffic originating
-					// from localhost to be seen by Docker at all.
+					// from localhost to be seen by Docker at all. With
+					// explicit scope, the rule is created only for the
+					// managed IPv4 gateway endpoint Docker selected for
+					// the container; a published port routed through an
+					// unmanaged gateway endpoint remains untouched.
 					hostPortInt, err := strconv.ParseUint(hostPort.HostPort, 10, 16)
 					if err != nil {
 						return nil, fmt.Errorf("error parsing host port of port mapping: %w", err)
@@ -1130,6 +1140,56 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 	}
 
 	return nftRules, nil
+}
+
+// dockerIPv4GatewayNetworkName follows Docker's endpoint selection rule for the
+// IPv4 bridge-network configuration supported by Whalewall. Endpoints without
+// an IPv4 address and gateway cannot provide the IPv4 gateway. Of the remaining
+// endpoints, the highest gateway priority wins and the actual Docker network
+// name is the deterministic tie-breaker.
+func dockerIPv4GatewayNetworkName(networks map[string]*network.EndpointSettings) (string, error) {
+	names := slices.Collect(maps.Keys(networks))
+	slices.Sort(names)
+	var (
+		primary  string
+		priority int
+		found    bool
+	)
+	for _, name := range names {
+		endpoint := networks[name]
+		if endpoint == nil {
+			return "", fmt.Errorf("network %q has no endpoint settings", name)
+		}
+		if !endpoint.IPAddress.Is4() {
+			return "", fmt.Errorf("network %q has no valid IPv4 endpoint address", name)
+		}
+		if !endpoint.Gateway.IsValid() {
+			continue
+		}
+		if !endpoint.Gateway.Is4() {
+			return "", fmt.Errorf("network %q has a non-IPv4 gateway", name)
+		}
+		if !found || endpoint.GwPriority > priority {
+			primary = name
+			priority = endpoint.GwPriority
+			found = true
+		}
+	}
+	if !found {
+		return "", errors.New("no attached IPv4 gateway-capable endpoint")
+	}
+	return primary, nil
+}
+
+func hasLocalhostPublishedPort(ports network.PortMap) bool {
+	for _, bindings := range ports {
+		for _, binding := range bindings {
+			if binding.HostIP.IsValid() && (binding.HostIP.IsUnspecified() || binding.HostIP == localAddr) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // createOutputRules adds nftables rules to allow outbound access from

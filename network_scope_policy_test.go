@@ -3,6 +3,7 @@ package whalewall
 import (
 	"bytes"
 	"context"
+	"maps"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -362,7 +363,7 @@ func TestContainerListWaitingRuleHonorsDestinationScope(t *testing.T) {
 	}
 }
 
-func TestScopedMappedPortsDoNotGenerateGlobalOrUnselectedRules(t *testing.T) {
+func TestScopedMappedPortsUseManagedIPv4GatewayEndpoint(t *testing.T) {
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
 	cont.NetworkSettings.Ports = network.PortMap{
 		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
@@ -382,25 +383,62 @@ func TestScopedMappedPortsDoNotGenerateGlobalOrUnselectedRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createPortMappingRules() error = %v", err)
 	}
-	if len(rules) != 3 {
-		t.Fatalf("scoped mapped-port rule count = %d; want localhost drop and two external rules for one selected endpoint", len(rules))
+	if len(rules) != 4 {
+		t.Fatalf("scoped mapped-port rule count = %d; want gateway drop, host published-port drop, and two external rules for the selected IPv4 gateway endpoint", len(rules))
 	}
 	if !containsVerdict(rules[0].Exprs, expr.VerdictDrop) {
 		t.Fatalf("first scoped mapped-port rule does not deny localhost before external allows: %#v", rules[0])
 	}
-	for i, rule := range rules {
+	mainRules := 0
+	for _, rule := range rules {
 		if rule.Chain.Name == whalewallChainName {
-			t.Fatalf("explicit scope generated a global pre-DNAT rule: %#v", rule)
+			mainRules++
+			if !containsVerdict(rule.Exprs, expr.VerdictDrop) {
+				t.Fatalf("scoped gateway host published-port rule is not a drop: %#v", rule)
+			}
 		}
-		if i > 0 && containsVerdict(rule.Exprs, expr.VerdictDrop) {
-			t.Fatalf("external allow rule #%d unexpectedly drops traffic: %#v", i, rule)
+	}
+	if mainRules != 1 {
+		t.Fatalf("scoped gateway host published-port rule count = %d; want 1", mainRules)
+	}
+}
+
+func TestScopedMappedPortsSkipManagedEndpointWithoutIPv4Gateway(t *testing.T) {
+	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
+	cont.NetworkSettings.Networks["demo_proxy"].Gateway = netip.Addr{}
+	cont.NetworkSettings.Ports = network.PortMap{
+		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
+	}
+	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
+	rules, err := (&RuleManager{}).createPortMappingRules(
+		&setRecordingFirewall{},
+		zap.NewNop(),
+		cont,
+		"source",
+		mappedPorts{External: externalRules{Allow: true}},
+		managed,
+		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
+		&nftables.Chain{Name: "source", Table: filterTable},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("createPortMappingRules() error = %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("rules without a managed gateway = %d; want only two selected-network external rules", len(rules))
+	}
+	for _, rule := range rules {
+		if rule.Chain.Name == whalewallChainName {
+			t.Fatalf("endpoint without an IPv4 gateway received a host published-port rule: %#v", rule)
 		}
 	}
 }
 
-func TestScopedMappedPortsWithoutGatewayFailClosed(t *testing.T) {
+func TestScopedMappedPortsFailClosedWithoutIPv4GatewayEndpoint(t *testing.T) {
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
-	cont.NetworkSettings.Networks["demo_proxy"].Gateway = netip.Addr{}
+	for _, endpoint := range cont.NetworkSettings.Networks {
+		endpoint.Gateway = netip.Addr{}
+	}
 	cont.NetworkSettings.Ports = network.PortMap{
 		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
 	}
@@ -416,12 +454,105 @@ func TestScopedMappedPortsWithoutGatewayFailClosed(t *testing.T) {
 		&nftables.Chain{Name: "source", Table: filterTable},
 		true,
 	)
-	if err == nil || !strings.Contains(err.Error(), "has no gateway") {
-		t.Fatalf("createPortMappingRules() error = %v; want scoped gateway error", err)
+	if err == nil || !strings.Contains(err.Error(), "cannot identify Docker's IPv4 gateway endpoint") {
+		t.Fatalf("createPortMappingRules() error = %v; want fail-closed gateway error", err)
 	}
 }
 
-func TestNarrowingScopeRemovesLegacyGlobalMappedPortRules(t *testing.T) {
+func TestDockerIPv4GatewayNetworkName(t *testing.T) {
+	tests := []struct {
+		name     string
+		networks map[string]*network.EndpointSettings
+		want     string
+		wantErr  string
+	}{
+		{
+			name: "highest priority",
+			networks: map[string]*network.EndpointSettings{
+				"proxy":      {IPAddress: netip.MustParseAddr("172.30.0.2"), Gateway: netip.MustParseAddr("172.30.0.1"), GwPriority: 2},
+				"monitoring": {IPAddress: netip.MustParseAddr("172.31.0.2"), Gateway: netip.MustParseAddr("172.31.0.1"), GwPriority: 1},
+			},
+			want: "proxy",
+		},
+		{
+			name: "lexical tie after ineligible endpoint",
+			networks: map[string]*network.EndpointSettings{
+				"a_internal": {IPAddress: netip.MustParseAddr("172.29.0.2"), GwPriority: 0},
+				"b_proxy":    {IPAddress: netip.MustParseAddr("172.30.0.2"), Gateway: netip.MustParseAddr("172.30.0.1"), GwPriority: -1},
+				"c_wan":      {IPAddress: netip.MustParseAddr("172.31.0.2"), Gateway: netip.MustParseAddr("172.31.0.1"), GwPriority: -1},
+			},
+			want: "b_proxy",
+		},
+		{
+			name: "no IPv4 gateway",
+			networks: map[string]*network.EndpointSettings{
+				"proxy": {IPAddress: netip.MustParseAddr("172.30.0.2")},
+			},
+			wantErr: "no attached IPv4 gateway-capable endpoint",
+		},
+		{
+			name: "mixed nil and valid endpoints",
+			networks: map[string]*network.EndpointSettings{
+				"monitoring": nil,
+				"proxy":      {IPAddress: netip.MustParseAddr("172.30.0.2"), Gateway: netip.MustParseAddr("172.30.0.1")},
+			},
+			wantErr: "has no endpoint settings",
+		},
+		{
+			name: "mixed malformed and valid endpoints",
+			networks: map[string]*network.EndpointSettings{
+				"monitoring": {Gateway: netip.MustParseAddr("172.31.0.1")},
+				"proxy":      {IPAddress: netip.MustParseAddr("172.30.0.2"), Gateway: netip.MustParseAddr("172.30.0.1")},
+			},
+			wantErr: "has no valid IPv4 endpoint address",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := dockerIPv4GatewayNetworkName(tt.networks)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("dockerIPv4GatewayNetworkName() error = %v; want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("dockerIPv4GatewayNetworkName() = (%q, %v); want (%q, nil)", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestScopedMappedPortsLeaveUnmanagedIPv4GatewayEndpointUntouched(t *testing.T) {
+	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
+	cont.NetworkSettings.Networks["demo_monitoring"].GwPriority = 2
+	cont.NetworkSettings.Ports = network.PortMap{
+		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
+	}
+	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
+	rules, err := (&RuleManager{}).createPortMappingRules(
+		&setRecordingFirewall{},
+		zap.NewNop(),
+		cont,
+		"source",
+		mappedPorts{External: externalRules{Allow: true}},
+		managed,
+		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
+		&nftables.Chain{Name: "source", Table: filterTable},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("createPortMappingRules() error = %v", err)
+	}
+	for _, rule := range rules {
+		if rule.Chain.Name == whalewallChainName {
+			t.Fatalf("unmanaged gateway endpoint received a host published-port rule: %#v", rule)
+		}
+	}
+}
+
+func TestNarrowingScopeReplacesLegacyGlobalMappedPortRules(t *testing.T) {
 	r, firewallCreator := newHardeningTestManager(t)
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", map[string]string{
 		enabledLabel: "true",
@@ -436,24 +567,58 @@ func TestNarrowingScopeRemovesLegacyGlobalMappedPortRules(t *testing.T) {
 	if err := r.createContainerRules(context.Background(), cont, true); err != nil {
 		t.Fatalf("create legacy all-network mapped-port policy: %v", err)
 	}
-	assertMainChainOwnerRule(t, firewallCreator, scopeSourceID, true)
+	assertSourceMainChainRuleCount(t, firewallCreator, 2)
 
 	cont.Config.Labels[managedNetworksLabel] = "proxy"
 	if err := r.createContainerRules(context.Background(), cont, false); err != nil {
 		t.Fatalf("narrow mapped-port policy: %v", err)
 	}
-	assertMainChainOwnerRule(t, firewallCreator, scopeSourceID, false)
+	assertSourceMainChainRuleCount(t, firewallCreator, 1)
+}
+
+func TestScopedMappedPortGatewayTransitionRemovesHostRule(t *testing.T) {
+	r, firewallCreator := newHardeningTestManager(t)
+	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", map[string]string{
+		enabledLabel:         "true",
+		managedNetworksLabel: "proxy",
+		rulesLabel: `mapped_ports:
+  external:
+    allow: true`,
+	})
+	cont.NetworkSettings.Ports = network.PortMap{
+		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
+	}
+	r.dockerCli = newMockDockerClient([]container.InspectResponse{cont})
+
+	if err := r.createContainerRules(context.Background(), cont, true); err != nil {
+		t.Fatalf("create managed-gateway mapped-port policy: %v", err)
+	}
+	assertSourceMainChainRuleCount(t, firewallCreator, 1)
+
+	cont.NetworkSettings.Networks["demo_monitoring"].GwPriority = 2
+	if err := r.createContainerRules(context.Background(), cont, false); err != nil {
+		t.Fatalf("move mapped port to unmanaged gateway: %v", err)
+	}
+	assertSourceMainChainRuleCount(t, firewallCreator, 0)
 }
 
 func scopedTestContainer(id, name, proxyAddr, monitoringAddr string, labels map[string]string) container.InspectResponse {
+	containerLabels := maps.Clone(labels)
+	if containerLabels == nil {
+		containerLabels = make(map[string]string)
+	}
+	if _, exists := containerLabels[composeProjectLabel]; !exists {
+		containerLabels[composeProjectLabel] = "demo"
+	}
 	return container.InspectResponse{
 		ID: id, Name: "/" + name,
-		Config: &container.Config{Labels: labels},
+		Config: &container.Config{Labels: containerLabels},
 		NetworkSettings: &container.NetworkSettings{Networks: map[string]*network.EndpointSettings{
 			"demo_proxy": {
-				NetworkID: "proxy-network-id",
-				Gateway:   netip.MustParseAddr("172.30.0.1"),
-				IPAddress: netip.MustParseAddr(proxyAddr),
+				NetworkID:  "proxy-network-id",
+				Gateway:    netip.MustParseAddr("172.30.0.1"),
+				IPAddress:  netip.MustParseAddr(proxyAddr),
+				GwPriority: 1,
 			},
 			"demo_monitoring": {
 				NetworkID: "monitoring-network-id",
@@ -529,17 +694,17 @@ func assertSourceDatabaseAddresses(t *testing.T, r *RuleManager, want ...string)
 	}
 }
 
-func assertMainChainOwnerRule(t *testing.T, creator mockFirewallCreatorI, owner string, want bool) {
+func assertSourceMainChainRuleCount(t *testing.T, creator mockFirewallCreatorI, want int) {
 	t.Helper()
-	found := false
+	found := 0
 	creator.readBaseFirewall(func(base *mockFirewall) {
 		for _, rule := range base.chains[whalewallChainName].Rules {
-			if bytes.Equal(rule.UserData, []byte(owner)) {
-				found = true
+			if bytes.Equal(rule.UserData, []byte(scopeSourceID)) {
+				found++
 			}
 		}
 	})
 	if found != want {
-		t.Fatalf("main-chain rule owned by %s present = %t; want %t", owner[:12], found, want)
+		t.Fatalf("main-chain rules owned by %s = %d; want %d", scopeSourceID[:12], found, want)
 	}
 }
