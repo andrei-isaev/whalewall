@@ -141,7 +141,13 @@ topology.
 
 ### Docker image
 
-Build from a reviewed commit and give the result an immutable tag:
+The `Publish image` GitHub Actions workflow publishes `linux/amd64` images to
+`ghcr.io/andrei-isaev/whalewall`. Manual publication is restricted to `master`; version tags must
+start with `v`. The workflow refuses to publish unless the exact source commit already passed the
+Docker 29 `Test` workflow. It publishes a human-readable `sha-<full-commit>` tag and reports the
+immutable registry digest in its run summary. It never publishes `latest`.
+
+To build the same reviewed source locally instead, give the result a commit-derived convenience tag:
 
 ```sh
 docker build --pull --platform=linux/amd64 \
@@ -149,30 +155,39 @@ docker build --pull --platform=linux/amd64 \
   --tag "whalewall:$(git rev-parse --short=12 HEAD)" .
 ```
 
+Local tags remain mutable. Push a local build to a registry and deploy the registry digest if this
+GHCR workflow is not used.
+
 Ensure whalewall is given necessary permissions, and that it is using `host` network mode. This
 allows the whalewall container to modify host firewall rules.
 
-Example Docker compose file:
+An image digest, rather than a tag, should be used for deployment. The ready-to-use
+[`deploy/compose.yml`](deploy/compose.yml) template is specifically for the image published by this
+repository's GHCR workflow and requires its immutable digest through an environment variable.
 
-```yaml
-services:
-  whalewall:
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_ADMIN
-    image: whalewall:<reviewed-commit>
-    network_mode: host
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    volumes:
-      - whalewall_data:/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+If the GHCR package is private, authenticate the deployment host with a credential limited to
+package reads before pulling (or make the package public):
 
-volumes:
-  whalewall_data:
+```sh
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+unset GHCR_TOKEN
 ```
+
+Never pass registry credentials or the host's Docker client configuration into the Whalewall
+container. Then create the persistent state volume and deploy:
+
+```sh
+docker volume create whalewall_data
+export WHALEWALL_IMAGE_DIGEST='<published-image-digest-without-the-sha256-prefix>'
+docker compose -f deploy/compose.yml pull
+docker compose -f deploy/compose.yml up -d
+```
+
+The fixed external volume prevents `docker compose down -v` from deleting Whalewall's ownership
+database. The template also fixes the registry and `sha256:` prefix, so the environment variable
+cannot replace the reviewed artifact with a mutable tag. Treat the checked-in template as
+authoritative: its long bind syntax also refuses to create a directory when the Docker socket is
+missing.
 
 ### First hardened deployment
 
@@ -461,7 +476,7 @@ tag is useful for humans but is not an immutable deployment identity:
 ```yaml
 services:
   whalewall:
-    image: registry.example/whalewall@sha256:<reviewed-image-digest>
+    image: ghcr.io/andrei-isaev/whalewall@sha256:<reviewed-64-hex-digest>
 ```
 
 Record the source commit and image digest together in the deployment repository. Rebuild and review
@@ -478,4 +493,5 @@ git commit -m 'Pin hardened whalewall'
 ```
 
 Build from `third_party/whalewall`, then deploy the resulting image by digest rather than by its
-mutable tag.
+mutable tag. A submodule is unnecessary when using the reviewed GHCR artifact; record its source
+commit and image digest together in the deployment repository instead.

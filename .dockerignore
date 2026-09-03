@@ -2,5 +2,6 @@
 .github
 .gitignore
 *.md
+deploy
 whalewall
 whalewall.test

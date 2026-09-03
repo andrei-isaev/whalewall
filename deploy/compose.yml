@@ -1,0 +1,39 @@
+name: whalewall
+
+services:
+  whalewall:
+    image: "ghcr.io/andrei-isaev/whalewall@sha256:${WHALEWALL_IMAGE_DIGEST:?Set WHALEWALL_IMAGE_DIGEST to the reviewed 64-hex digest}"
+    platform: linux/amd64
+    container_name: whalewall
+    user: "0:0"
+    userns_mode: host
+    privileged: false
+    restart: unless-stopped
+    stop_grace_period: 30s
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - type: volume
+        source: whalewall_data
+        target: /data
+        volume:
+          nocopy: true
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  whalewall_data:
+    name: whalewall_data
+    external: true
