@@ -265,6 +265,58 @@ func TestMixedAddressAndPortSetsUseMergedExclusiveIntervals(t *testing.T) {
 	}
 }
 
+func TestRuleFixtureUnionSetsHaveExactBounds(t *testing.T) {
+	chain := &nftables.Chain{Name: "test", Table: filterTable}
+
+	ipFirewall := &setRecordingFirewall{}
+	_, err := createIPExprs(ipFirewall, []addrOrRange{
+		{addr: netip.MustParseAddr("1.1.1.1")},
+		{addrRange: netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.1.0/24"))},
+	}, dstAddrOffset, chain)
+	if err != nil {
+		t.Fatalf("createIPExprs() error = %v", err)
+	}
+	if ipFirewall.set == nil || !ipFirewall.set.Anonymous || !ipFirewall.set.Constant ||
+		!ipFirewall.set.Interval || ipFirewall.set.KeyType != nftables.TypeIPAddr {
+		t.Fatalf("IP union set schema = %#v", ipFirewall.set)
+	}
+	wantIPs := [][]byte{{1, 1, 1, 1}, {1, 1, 1, 2}, {192, 168, 1, 0}, {192, 168, 2, 0}}
+	if len(ipFirewall.elements) != len(wantIPs) {
+		t.Fatalf("IP union elements = %#v, want %d elements", ipFirewall.elements, len(wantIPs))
+	}
+	for i, want := range wantIPs {
+		if !bytes.Equal(ipFirewall.elements[i].Key, want) ||
+			ipFirewall.elements[i].IntervalEnd != (i%2 == 1) ||
+			len(ipFirewall.elements[i].KeyEnd) != 0 {
+			t.Fatalf("IP union element %d = %#v, want key %v end=%v", i, ipFirewall.elements[i], want, i%2 == 1)
+		}
+	}
+
+	portFirewall := &setRecordingFirewall{}
+	_, err = createPortExprs(portFirewall, []rulePorts{
+		{single: 80},
+		{interval: portInterval{min: 420, max: 9001}},
+	}, dstPortOffset, chain)
+	if err != nil {
+		t.Fatalf("createPortExprs() error = %v", err)
+	}
+	if portFirewall.set == nil || !portFirewall.set.Anonymous || !portFirewall.set.Constant ||
+		!portFirewall.set.Interval || portFirewall.set.KeyType != nftables.TypeInetService {
+		t.Fatalf("port union set schema = %#v", portFirewall.set)
+	}
+	wantPorts := []uint16{80, 81, 420, 9002}
+	if len(portFirewall.elements) != len(wantPorts) {
+		t.Fatalf("port union elements = %#v, want %d elements", portFirewall.elements, len(wantPorts))
+	}
+	for i, want := range wantPorts {
+		if got := binary.BigEndian.Uint16(portFirewall.elements[i].Key); got != want ||
+			portFirewall.elements[i].IntervalEnd != (i%2 == 1) ||
+			len(portFirewall.elements[i].KeyEnd) != 0 {
+			t.Fatalf("port union element %d = %#v, want %d end=%v", i, portFirewall.elements[i], want, i%2 == 1)
+		}
+	}
+}
+
 func TestIntervalSetTopBoundaryUsesOpenEndedStart(t *testing.T) {
 	chain := &nftables.Chain{Name: "test", Table: filterTable}
 	portFirewall := &setRecordingFirewall{}

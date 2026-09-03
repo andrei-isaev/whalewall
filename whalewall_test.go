@@ -56,17 +56,17 @@ func TestIntegration(t *testing.T) {
 		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed
 		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is not allowed
 		is.True(runClientCmd(t, "curl --connect-timeout 1 https://www.google.com") == 0) // DNS and HTTPS is allowed externally
-		is.True(portOpen(t, "client", "server", 756, false))                             // tcp port 756 is allowed client -> server
-		is.True(!portOpen(t, "client", "server", 756, true))                             // udp port 756 is not allowed client -> server
-		is.True(portOpen(t, "client", "server", 757, true))                              // udp port 757 is allowed client -> server
-		is.True(!portOpen(t, "client", "server", 80, false))                             // tcp port 80 is not allowed client -> server
-		is.True(!portOpen(t, "client", "server", 80, true))                              // udp port 80 is not allowed client -> server
-		is.True(portOpen(t, "tester", "localhost", 8080, false))                         // tcp mapped port 8080:80 of client is allowed from localhost
-		is.True(portOpen(t, "tester", "localhost", 8080, true))                          // udp mapped port 8080:80 of client is allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 8081, false))                        // tcp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 8081, true))                         // udp mapped port 8081:80 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 9001, false))                        // tcp mapped port 9001:9001 of server is not allowed from localhost
-		is.True(!portOpen(t, "tester", "localhost", 9001, true))                         // udp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(tcpPortOpen(t, "client", "server", 756))                                 // tcp port 756 is allowed client -> server
+		is.True(!udpPortOpen(t, "client", "server", 756, "server", 756))                 // udp port 756 is not allowed client -> server
+		is.True(udpPortOpen(t, "client", "server", 757, "server", 757))                  // udp port 757 is allowed client -> server
+		is.True(!tcpPortOpen(t, "client", "server", 80))                                 // tcp port 80 is not allowed client -> server
+		is.True(!udpPortOpen(t, "client", "server", 80, "server", 80))                   // udp port 80 is not allowed client -> server
+		is.True(tcpPortOpen(t, "tester", "localhost", 8080))                             // tcp mapped port 8080:80 of client is allowed from localhost
+		is.True(udpPortOpen(t, "tester", "localhost", 8080, "client", 80))               // udp mapped port 8080:80 of client is allowed from localhost
+		is.True(!tcpPortOpen(t, "tester", "localhost", 8081))                            // tcp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!udpPortOpen(t, "tester", "localhost", 8081, "server", 80))              // udp mapped port 8081:80 of server is not allowed from localhost
+		is.True(!tcpPortOpen(t, "tester", "localhost", 9001))                            // tcp mapped port 9001:9001 of server is not allowed from localhost
+		is.True(!udpPortOpen(t, "tester", "localhost", 9001, "server", 9001))            // udp mapped port 9001:9001 of server is not allowed from localhost
 	}
 
 	tempDir := t.TempDir()
@@ -765,7 +765,159 @@ func startFunc(t *testing.T, is *is.I, tempDir string) *whalewallTestProcess {
 	}
 }
 
-func portOpen(t *testing.T, container, host string, port uint16, udp bool) bool {
+func tcpPortOpen(t *testing.T, container, host string, port uint16) bool {
+	t.Helper()
+
+	return probePortWithNmap(t, container, host, port, false) == nmapPortOpen
+}
+
+func udpPortOpen(
+	t *testing.T,
+	container string,
+	host string,
+	port uint16,
+	receiver string,
+	receiverPort uint16,
+) bool {
+	t.Helper()
+
+	requireReceiverRunning(t, receiver)
+	waitForUDPListener(t, receiver, receiverPort)
+	before := udpConnectionCount(t, receiver, receiverPort)
+	state := probePortWithNmap(t, container, host, port, true)
+
+	// The pinned eavesdropper listener deliberately never replies to UDP.
+	// Consequently, nmap cannot distinguish a permitted listener from a
+	// silently dropped packet: both are reported as open|filtered. Prove that
+	// the datagram crossed the firewall by observing the receiver instead.
+	after := udpConnectionCount(t, receiver, receiverPort)
+	if after == before {
+		// Give the Docker log driver one bounded opportunity to publish the
+		// receiver's message without launching a tight loop of CLI processes.
+		time.Sleep(defaultTimeout)
+		after = udpConnectionCount(t, receiver, receiverPort)
+	}
+	requireReceiverRunning(t, receiver)
+	if after < before {
+		t.Fatalf(
+			"%s UDP receiver log count went backwards for port %d: %d -> %d",
+			receiver,
+			receiverPort,
+			before,
+			after,
+		)
+	}
+	if state == nmapPortOpen && after == before {
+		t.Fatalf(
+			"nmap proved UDP %s:%d open, but the expected receiver %s:%d did not observe it",
+			host,
+			port,
+			receiver,
+			receiverPort,
+		)
+	}
+
+	reached := after > before
+	t.Logf(
+		"UDP probe %s:%d reached %s:%d = %t (nmap state %s; receiver count %d -> %d)",
+		host,
+		port,
+		receiver,
+		receiverPort,
+		reached,
+		state,
+		before,
+		after,
+	)
+	return reached
+}
+
+func requireReceiverRunning(t *testing.T, receiver string) {
+	t.Helper()
+
+	args := []string{
+		"docker",
+		"compose",
+		"-f=testdata/docker-compose.yml",
+		"exec",
+		"-T",
+		receiver,
+		"true",
+	}
+	output, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("UDP receiver %s is not running: %v\n%s", receiver, err, output)
+	}
+}
+
+func udpConnectionCount(t *testing.T, receiver string, port uint16) int {
+	t.Helper()
+
+	output := receiverLogs(t, receiver)
+	listeningMarker := fmt.Sprintf("listening on udp port %d", port)
+	if !containsLogLine(output, listeningMarker) {
+		t.Fatalf(
+			"%s is not proven to have a live UDP listener on port %d:\n%s",
+			receiver,
+			port,
+			output,
+		)
+	}
+
+	connectionMarker := []byte(fmt.Sprintf("got udp connection on port %d from ", port))
+	return bytes.Count(output, connectionMarker)
+}
+
+func waitForUDPListener(t *testing.T, receiver string, port uint16) {
+	t.Helper()
+
+	listeningMarker := fmt.Sprintf("listening on udp port %d", port)
+	deadline := time.Now().Add(defaultTimeout)
+	for {
+		output := receiverLogs(t, receiver)
+		if containsLogLine(output, listeningMarker) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"timed out proving %s has a live UDP listener on port %d:\n%s",
+				receiver,
+				port,
+				output,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func receiverLogs(t *testing.T, receiver string) []byte {
+	t.Helper()
+
+	args := []string{
+		"docker",
+		"compose",
+		"-f=testdata/docker-compose.yml",
+		"logs",
+		"--no-color",
+		receiver,
+	}
+	output, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read %s receiver logs: %v\n%s", receiver, err, output)
+	}
+	return output
+}
+
+func containsLogLine(output []byte, message string) bool {
+	for line := range strings.Lines(string(output)) {
+		if strings.HasSuffix(strings.TrimSpace(line), message) {
+			return true
+		}
+	}
+	return false
+}
+
+func probePortWithNmap(t *testing.T, container, host string, port uint16, udp bool) nmapPortState {
 	t.Helper()
 
 	scanType := "-sT"
@@ -787,12 +939,27 @@ func portOpen(t *testing.T, container, host string, port uint16, udp bool) bool 
 		"-n",
 		"-Pn",
 		scanType,
+	}
+	if udp {
+		// Send a real datagram rather than relying on nmap's empty default
+		// payload. The receiver log is the authoritative reachability signal, so
+		// retransmissions would only slow denial checks and muddy the log delta.
+		args = append(
+			args,
+			"--data-string",
+			"whalewall-udp-probe",
+			"--max-retries",
+			"0",
+		)
+	}
+	args = append(
+		args,
 		"-p",
 		strconv.FormatUint(uint64(port), 10),
 		"-oG",
 		"-",
 		host,
-	}
+	)
 	t.Logf("running %v", args)
 
 	output, err := exec.Command(args[0], args[1:]...).CombinedOutput()
@@ -805,7 +972,7 @@ func portOpen(t *testing.T, container, host string, port uint16, udp bool) bool 
 		t.Fatalf("could not parse nmap probe output: %v\n%s", err, output)
 	}
 
-	return state == nmapPortOpen
+	return state
 }
 
 type nmapPortState uint8
@@ -815,6 +982,19 @@ const (
 	nmapPortNotOpen
 	nmapPortOpen
 )
+
+func (s nmapPortState) String() string {
+	switch s {
+	case nmapPortInvalid:
+		return "invalid"
+	case nmapPortNotOpen:
+		return "filtered-or-open|filtered"
+	case nmapPortOpen:
+		return "open"
+	default:
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+}
 
 func parseNmapPortState(output string, port uint16, protocol string) (nmapPortState, error) {
 	portPattern := regexp.MustCompile(fmt.Sprintf(`(?:^|[\t ,])%d/([^/]+)/%s/`, port, protocol))
@@ -1176,9 +1356,10 @@ output:
 							matchProtoExprs(unix.IPPROTO_TCP),
 							[]expr.Any{
 								getPortExpr(dstPortOffset),
-								comparePortExpr(80),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
 							},
-							comparePortsExprs(portInterval{420, 9001}),
 							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
@@ -1193,9 +1374,10 @@ output:
 							matchProtoExprs(unix.IPPROTO_TCP),
 							[]expr.Any{
 								getPortExpr(srcPortOffset),
-								comparePortExpr(80),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
 							},
-							comparePortsExprs(portInterval{420, 9001}),
 							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
@@ -1477,9 +1659,10 @@ output:
 							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
 							[]expr.Any{
 								getAddrExpr(dstAddrOffset),
-								compareAddrExpr(ref(dstAddr.As4())[:]),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
 							},
-							compareAddrRangeExprs(ref(lowDstAddr.As4())[:], ref(highDstAddr.As4())[:]),
 							matchProtoExprs(unix.IPPROTO_UDP),
 							matchPortExprs(53, dstPortOffset),
 							matchConnStateExprs(stateNewEst),
@@ -1494,9 +1677,10 @@ output:
 						Exprs: slicesJoin(
 							[]expr.Any{
 								getAddrExpr(srcAddrOffset),
-								compareAddrExpr(ref(dstAddr.As4())[:]),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
 							},
-							compareAddrRangeExprs(ref(lowDstAddr.As4())[:], ref(highDstAddr.As4())[:]),
 							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
 							matchProtoExprs(unix.IPPROTO_UDP),
 							matchPortExprs(53, srcPortOffset),
@@ -1943,8 +2127,8 @@ output:
 							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
 							matchAddrExprs(ref(cont2Addr.As4())[:], dstAddrOffset),
 							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(101, srcPortOffset),
-							matchConnStateExprs(stateEst),
+							matchPortExprs(202, dstPortOffset),
+							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
 								allowReturnVerdict,
@@ -1957,8 +2141,8 @@ output:
 							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
 							matchAddrExprs(ref(cont2Addr.As4())[:], dstAddrOffset),
 							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(202, dstPortOffset),
-							matchConnStateExprs(stateNewEst),
+							matchPortExprs(101, srcPortOffset),
+							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
 								allowReturnVerdict,
@@ -1983,8 +2167,8 @@ output:
 							matchAddrExprs(ref(cont2Addr.As4())[:], srcAddrOffset),
 							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
 							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(101, dstPortOffset),
-							matchConnStateExprs(stateNewEst),
+							matchPortExprs(202, srcPortOffset),
+							matchConnStateExprs(stateEst),
 							[]expr.Any{
 								&expr.Counter{},
 								allowReturnVerdict,
@@ -1997,8 +2181,8 @@ output:
 							matchAddrExprs(ref(cont2Addr.As4())[:], srcAddrOffset),
 							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
 							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(202, srcPortOffset),
-							matchConnStateExprs(stateEst),
+							matchPortExprs(101, dstPortOffset),
+							matchConnStateExprs(stateNewEst),
 							[]expr.Any{
 								&expr.Counter{},
 								allowReturnVerdict,
