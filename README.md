@@ -282,9 +282,12 @@ Configuration is decoded strictly. In particular:
   host published-port localhost rules are installed only when Docker's selected IPv4 gateway endpoint
   is managed; published ports routed through an unmanaged gateway endpoint remain untouched. For the
   supported IPv4 bridge setup, Docker selects the highest `gw_priority` among IPv4 gateway-capable
-  endpoints and uses the actual network name as a tie-breaker. Set `gw_priority` explicitly when a
-  container publishes ports and joins both managed and unmanaged networks so the intended endpoint
-  is unambiguous to operators.
+  endpoints and uses the actual network name as a tie-breaker. For WhaleWall, set `gw_priority` only
+  on a container that publishes host ports with `ports:` and has more than one IPv4 gateway-capable
+  network. Give the managed network the higher priority when its published ports should be covered
+  by WhaleWall. Containers without `ports:`—including containers that use only `expose:`—do not need
+  `gw_priority` for WhaleWall; `managed_networks` is sufficient. You may still set `gw_priority`
+  independently when you need to choose the container's default outbound gateway.
 
 ### Reverse proxy isolation
 
