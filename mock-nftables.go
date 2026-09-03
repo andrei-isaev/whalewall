@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -694,5 +695,25 @@ func pointersEqual[T comparable](a, b *T) bool {
 
 func clone[T any](t T) T {
 	//nolint: forcetypeassert
-	return copystructure.Must(copystructure.Copy(t)).(T)
+	return copystructure.Must(mockCopyConfig.Copy(t)).(T)
+}
+
+var mockCopyConfig = func() copystructure.Config {
+	copiers := make(map[reflect.Type]copystructure.CopierFunc, len(copystructure.Copiers)+1)
+	for typ, copier := range copystructure.Copiers {
+		copiers[typ] = copier
+	}
+	// SetDatatype contains nftMagic, an unexported field used by nftables to
+	// distinguish kernel datatypes. copystructure cannot reflect-copy that
+	// field, so preserve this immutable value as a unit in the firewall mock.
+	copiers[reflect.TypeOf(nftables.SetDatatype{})] = copyNftablesSetDatatype
+	return copystructure.Config{Copiers: copiers}
+}()
+
+func copyNftablesSetDatatype(value any) (any, error) {
+	datatype, ok := value.(nftables.SetDatatype)
+	if !ok {
+		return nil, fmt.Errorf("copy nftables set datatype from %T", value)
+	}
+	return datatype, nil
 }

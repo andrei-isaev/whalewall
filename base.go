@@ -52,7 +52,10 @@ var (
 		Table: filterTable,
 		Type:  nftables.ChainTypeFilter,
 	}
-	srcJumpRule = &nftables.Rule{
+)
+
+func createSourceDispatcherRule() *nftables.Rule {
+	return &nftables.Rule{
 		Table: filterTable,
 		Chain: whalewallChain,
 		Exprs: []expr.Any{
@@ -73,7 +76,10 @@ var (
 			},
 		},
 	}
-	dstJumpRule = &nftables.Rule{
+}
+
+func createDestinationDispatcherRule() *nftables.Rule {
+	return &nftables.Rule{
 		Table: filterTable,
 		Chain: whalewallChain,
 		Exprs: []expr.Any{
@@ -94,7 +100,7 @@ var (
 			},
 		},
 	}
-)
+}
 
 func (r *RuleManager) createBaseRules() error {
 	r.addressMapMu.Lock()
@@ -370,6 +376,8 @@ func ensureJumpAtHead(nfc firewallClient, logger *zap.Logger, desired *nftables.
 }
 
 func ensureDispatchersAtHead(nfc firewallClient, logger *zap.Logger, current []*nftables.Rule) error {
+	srcJumpRule := createSourceDispatcherRule()
+	dstJumpRule := createDestinationDispatcherRule()
 	srcCount, dstCount := 0, 0
 	allRemainderSafe := true
 	for _, rule := range current {

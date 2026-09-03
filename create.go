@@ -143,8 +143,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 		Table: filterTable,
 		Type:  nftables.ChainTypeFilter,
 	}
-	dropRule, err := ensureContainerDropPolicy(nfc, logger, chain, container.ID, quarantineFirst)
-	if err != nil {
+	if err := ensureContainerDropPolicy(nfc, logger, chain, container.ID, quarantineFirst); err != nil {
 		return err
 	}
 
@@ -178,7 +177,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 		}
 
 		logger.Warn("policy creation failed, quarantining container", zap.Error(retErr))
-		if err := r.quarantineContainerPolicy(cleanupCtx, logger, chain, dropRule, container.ID); err != nil {
+		if err := r.quarantineContainerPolicy(cleanupCtx, logger, chain, container.ID); err != nil {
 			logger.Error("error quarantining failed policy", zap.Error(err))
 			retErr = errors.Join(retErr, err)
 		}
@@ -259,7 +258,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := replaceContainerPolicy(nfc, logger, chain, dropRule, container.ID, desiredRules); err != nil {
+	if err := replaceContainerPolicy(nfc, logger, chain, container.ID, desiredRules); err != nil {
 		return fmt.Errorf("error replacing container policy: %w", err)
 	}
 
@@ -310,7 +309,7 @@ func (r *RuleManager) reconcileContainerMetadata(ctx context.Context, nfc firewa
 // replacement. The container's own chain is rebuilt completely and rules
 // owned by this source are removed from every other Whalewall chain before
 // the desired policy is inserted in the same nftables transaction.
-func replaceContainerPolicy(nfc firewallClient, logger *zap.Logger, ownChain *nftables.Chain, dropRule *nftables.Rule, id string, desired []*nftables.Rule) error {
+func replaceContainerPolicy(nfc firewallClient, logger *zap.Logger, ownChain *nftables.Chain, id string, desired []*nftables.Rule) error {
 	chains, err := nfc.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
 	if err != nil {
 		return fmt.Errorf("error listing IPv4 chains: %w", err)
@@ -375,8 +374,10 @@ func replaceContainerPolicy(nfc firewallClient, logger *zap.Logger, ownChain *nf
 		}
 	}
 	// Always recreate exactly one canonical terminal drop at the end of the
-	// source chain. No equality heuristic or anonymous-set wildcard is used.
-	nfc.AddRule(dropRule)
+	// source chain. nftables mutates a submitted Rule with its kernel handle,
+	// so this must be a fresh value rather than the rule used to establish the
+	// earlier enforcement floor.
+	nfc.AddRule(createDropRule(ownChain, id))
 	if err := nfc.Flush(); err != nil {
 		return fmt.Errorf("error flushing authoritative policy: %w", err)
 	}
@@ -384,12 +385,12 @@ func replaceContainerPolicy(nfc firewallClient, logger *zap.Logger, ownChain *nf
 	return nil
 }
 
-func (r *RuleManager) quarantineContainerPolicy(ctx context.Context, logger *zap.Logger, chain *nftables.Chain, dropRule *nftables.Rule, id string) error {
+func (r *RuleManager) quarantineContainerPolicy(ctx context.Context, logger *zap.Logger, chain *nftables.Chain, id string) error {
 	nfc, err := r.newFirewallClient()
 	if err != nil {
 		return fmt.Errorf("error creating fresh netlink connection for quarantine: %w", err)
 	}
-	firewallErr := replaceContainerPolicy(nfc, logger, chain, dropRule, id, nil)
+	firewallErr := replaceContainerPolicy(nfc, logger, chain, id, nil)
 	databaseErr := r.clearContainerPolicyMetadata(ctx, id)
 	return errors.Join(firewallErr, databaseErr)
 }
@@ -620,10 +621,10 @@ func containerIDFromChainName(name string) (string, error) {
 // ensureContainerDropPolicy creates a container chain with its terminal drop
 // rule atomically, or repairs a missing drop in an existing chain. A missing
 // drop is inserted first so an unexpectedly populated chain fails closed.
-func ensureContainerDropPolicy(nfc firewallClient, logger *zap.Logger, chain *nftables.Chain, id string, quarantineFirst bool) (*nftables.Rule, error) {
+func ensureContainerDropPolicy(nfc firewallClient, logger *zap.Logger, chain *nftables.Chain, id string, quarantineFirst bool) error {
 	chains, err := nfc.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
 	if err != nil {
-		return nil, fmt.Errorf("error listing IPv4 chains: %w", err)
+		return fmt.Errorf("error listing IPv4 chains: %w", err)
 	}
 
 	var existingChain *nftables.Chain
@@ -637,21 +638,21 @@ func ensureContainerDropPolicy(nfc firewallClient, logger *zap.Logger, chain *nf
 	dropRule := createDropRule(chain, id)
 	if existingChain != nil {
 		if err := validateRegularOwnedChain(existingChain); err != nil {
-			return nil, fmt.Errorf("unsafe container-chain name collision %q: %w", chain.Name, err)
+			return fmt.Errorf("unsafe container-chain name collision %q: %w", chain.Name, err)
 		}
 		rules, err := nfc.GetRules(chain.Table, chain)
 		if err != nil {
-			return nil, fmt.Errorf("error listing rules of %q chain: %w", chain.Name, err)
+			return fmt.Errorf("error listing rules of %q chain: %w", chain.Name, err)
 		}
 		// An existing terminal drop is not enough: stale permissive rules before
 		// it remain active while Docker/event reconciliation performs lookups and
 		// policy generation. Require the canonical drop at the head so every
 		// reconcile starts from quarantine and later atomically restores policy.
 		if len(rules) != 0 && rulesEqual(logger, dropRule, rules[0]) {
-			return dropRule, nil
+			return nil
 		}
 		if !quarantineFirst && slices.ContainsFunc(rules, func(rule *nftables.Rule) bool { return rulesEqual(logger, dropRule, rule) }) {
-			return dropRule, nil
+			return nil
 		}
 		nfc.InsertRule(dropRule)
 	} else {
@@ -660,9 +661,9 @@ func ensureContainerDropPolicy(nfc firewallClient, logger *zap.Logger, chain *nf
 	}
 
 	if err := nfc.Flush(); err != nil {
-		return nil, fmt.Errorf("error installing fail-closed policy: %w", err)
+		return fmt.Errorf("error installing fail-closed policy: %w", err)
 	}
-	return dropRule, nil
+	return nil
 }
 
 // stripName removes the leading "/" from a container name if necessary.

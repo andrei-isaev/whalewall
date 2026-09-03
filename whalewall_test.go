@@ -48,8 +48,10 @@ func TestIntegration(t *testing.T) {
 	t.Parallel()
 
 	is := is.New(t)
+	var whalewall *whalewallTestProcess
 
 	checkFirewallRules := func() {
+		requireWhalewallRunning(t, whalewall)
 		is.True(runClientCmd(t, "nslookup google.com") == 0)                             // udp port 53 is allowed
 		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.1.1.1") == 0)         // tcp port 80 to 1.1.1.1 is allowed
 		is.True(runClientCmd(t, "curl --connect-timeout 1 http://1.0.0.1") != 0)         // tcp port 80 to 1.0.0.1 is not allowed
@@ -68,9 +70,9 @@ func TestIntegration(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	stopWhalewall := startWhalewall(t, is, tempDir)
+	whalewall = startWhalewall(t, is, tempDir)
 	t.Cleanup(func() {
-		stopWhalewall()
+		whalewall.stop()
 	})
 
 	is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "up", "-d") == 0)
@@ -78,17 +80,24 @@ func TestIntegration(t *testing.T) {
 		run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "down")
 	})
 
-	// wait until whalewall has created firewall rules
-	time.Sleep(time.Second)
+	dockerClient, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		t.Fatalf("create Docker client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = dockerClient.Close()
+	})
+
+	// Do not turn an early Whalewall crash or a slow event reconciliation into
+	// misleading connectivity failures. Wait until both opted-in containers are
+	// mapped to complete, fail-closed policies before making network assertions.
+	waitForIntegrationState(t, "initial container policies", whalewall, func() error {
+		return checkInitialContainerPolicies(dockerClient)
+	})
 
 	checkFirewallRules()
 
 	// ensure correct nftables chains exist
-	dockerClient, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
-	is.NoErr(err)
-	t.Cleanup(func() {
-		dockerClient.Close()
-	})
 	containerResult, err := dockerClient.ContainerList(context.Background(), client.ContainerListOptions{})
 	is.NoErr(err)
 	containers := containerResult.Items
@@ -145,15 +154,15 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("replacement server has no valid IPv4 endpoint: %+v", server.NetworkSettings.Networks)
 	}
 
-	waitForIntegrationState(t, 15*time.Second, "same-address replacement policy", func() error {
+	waitForIntegrationState(t, "same-address replacement policy", whalewall, func() error {
 		return checkReplacementPolicy(serverAddr, clientChain.Name, oldServerChain.Name, oldServerID, serverChain.Name, server.ID, false, false)
 	})
 
 	// Startup reconciliation must remove the quarantined old chain while
 	// preserving both the address verdict and the replacement peer policy.
-	stopWhalewall()
-	stopWhalewall = startWhalewall(t, is, tempDir)
-	waitForIntegrationState(t, 15*time.Second, "replacement policy after Whalewall restart", func() error {
+	whalewall.stop()
+	whalewall = startWhalewall(t, is, tempDir)
+	waitForIntegrationState(t, "replacement policy after Whalewall restart", whalewall, func() error {
 		return checkReplacementPolicy(serverAddr, clientChain.Name, oldServerChain.Name, oldServerID, serverChain.Name, server.ID, true, true)
 	})
 	checkFirewallRules()
@@ -169,69 +178,66 @@ func TestIntegration(t *testing.T) {
 			// stop server container and verify that its chain is removed
 			t.Run("stop server", func(t *testing.T) {
 				if restart {
-					stopWhalewall()
+					whalewall.stop()
 				}
 				is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "stop", "server") == 0)
 				if restart {
-					stopWhalewall = startWhalewall(t, is, tempDir)
+					whalewall = startWhalewall(t, is, tempDir)
 				}
-				time.Sleep(time.Second)
-
-				chains, err := nfc.ListChains()
-				is.NoErr(err)
-				is.True(chainExists(clientChain.Name, chains))
-				is.True(!chainExists(serverChain.Name, chains))
+				waitForIntegrationState(t, "server chain removal", whalewall, func() error {
+					return checkContainerChainPresence(map[string]bool{
+						clientChain.Name: true,
+						serverChain.Name: false,
+					})
+				})
 			})
 
 			// stop client container and verify that its chain is removed
 			t.Run("stop client", func(t *testing.T) {
 				if restart {
-					stopWhalewall()
+					whalewall.stop()
 				}
 				is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "stop", "client") == 0)
 				if restart {
-					stopWhalewall = startWhalewall(t, is, tempDir)
+					whalewall = startWhalewall(t, is, tempDir)
 				}
-				time.Sleep(time.Second)
-
-				chains, err := nfc.ListChains()
-				is.NoErr(err)
-				is.True(!chainExists(clientChain.Name, chains))
-				is.True(!chainExists(serverChain.Name, chains))
+				waitForIntegrationState(t, "client chain removal", whalewall, func() error {
+					return checkContainerChainPresence(map[string]bool{
+						clientChain.Name: false,
+						serverChain.Name: false,
+					})
+				})
 			})
 
 			// start client container and verify that its chain is created
 			t.Run("start client", func(t *testing.T) {
 				if restart {
-					stopWhalewall()
+					whalewall.stop()
 				}
 				is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "start", "client") == 0)
 				if restart {
-					stopWhalewall = startWhalewall(t, is, tempDir)
+					whalewall = startWhalewall(t, is, tempDir)
 				}
-				time.Sleep(time.Second)
-
-				chains, err := nfc.ListChains()
-				is.NoErr(err)
-				is.True(chainExists(clientChain.Name, chains))
-				is.True(!chainExists(serverChain.Name, chains))
+				waitForIntegrationState(t, "client chain creation", whalewall, func() error {
+					return checkContainerChainPresence(map[string]bool{
+						clientChain.Name: true,
+						serverChain.Name: false,
+					})
+				})
 			})
 
 			// start server container and verify that its chain is created
 			t.Run("start server", func(t *testing.T) {
 				if restart {
-					stopWhalewall()
+					whalewall.stop()
 				}
 				is.True(run(t, "docker", "compose", "-f=testdata/docker-compose.yml", "start", "server") == 0)
 				if restart {
-					stopWhalewall = startWhalewall(t, is, tempDir)
+					whalewall = startWhalewall(t, is, tempDir)
 				}
-				time.Sleep(time.Second)
-
-				chains, err := nfc.ListChains()
-				is.NoErr(err)
-				is.True(chainExists(clientChain.Name, chains))
-				is.True(chainExists(serverChain.Name, chains))
+				waitForIntegrationState(t, "complete policies after server start", whalewall, func() error {
+					return checkInitialContainerPolicies(dockerClient)
+				})
 			})
 
 			// ensure rules are created properly again after recreating containers
@@ -240,14 +246,24 @@ func TestIntegration(t *testing.T) {
 	}
 }
 
-func waitForIntegrationState(t *testing.T, timeout time.Duration, description string, check func() error) {
+func waitForIntegrationState(t *testing.T, description string, whalewall *whalewallTestProcess, check func() error) {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(15 * time.Second)
 	var lastErr error
 	for {
+		if whalewall != nil {
+			if err := whalewall.runningError(); err != nil {
+				t.Fatalf("Whalewall exited while waiting for %s: %v", description, err)
+			}
+		}
 		lastErr = check()
 		if lastErr == nil {
+			if whalewall != nil {
+				if err := whalewall.runningError(); err != nil {
+					t.Fatalf("Whalewall exited while completing %s: %v", description, err)
+				}
+			}
 			return
 		}
 		if time.Now().After(deadline) {
@@ -255,6 +271,208 @@ func waitForIntegrationState(t *testing.T, timeout time.Duration, description st
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func checkContainerChainPresence(expected map[string]bool) error {
+	nfc, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("create nftables client: %w", err)
+	}
+	chains, err := nfc.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return fmt.Errorf("list IPv4 chains: %w", err)
+	}
+	for chainName, want := range expected {
+		got := false
+		for _, chain := range chains {
+			if chain.Table != nil && chain.Table.Name == filterTableName && chain.Name == chainName {
+				got = true
+				break
+			}
+		}
+		if got != want {
+			return fmt.Errorf("chain %q presence = %t, want %t", chainName, got, want)
+		}
+	}
+	return nil
+}
+
+func checkBasePolicyReady() error {
+	nfc, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("create nftables client: %w", err)
+	}
+
+	set, err := nfc.GetSetByName(filterTable, containerAddrSetName)
+	if err != nil {
+		return fmt.Errorf("get container address set: %w", err)
+	}
+	if !containerAddressSetSchemaEqual(set, containerAddressSet()) {
+		return errors.New("container address set has unexpected schema")
+	}
+
+	chains, err := nfc.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return fmt.Errorf("list IPv4 chains: %w", err)
+	}
+	var whalewallChain, dockerChain *nftables.Chain
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Table.Name != filterTableName {
+			continue
+		}
+		switch chain.Name {
+		case whalewallChainName:
+			whalewallChain = chain
+		case dockerChainName:
+			dockerChain = chain
+		}
+	}
+	if whalewallChain == nil {
+		return fmt.Errorf("chain %q does not exist", whalewallChainName)
+	}
+	if dockerChain == nil {
+		return fmt.Errorf("chain %q does not exist", dockerChainName)
+	}
+
+	logger := zap.NewNop()
+	rules, err := nfc.GetRules(filterTable, whalewallChain)
+	if err != nil {
+		return fmt.Errorf("get %q rules: %w", whalewallChainName, err)
+	}
+	if len(rules) < 2 || !rulesEqual(logger, rules[0], createSourceDispatcherRule()) || !rulesEqual(logger, rules[1], createDestinationDispatcherRule()) {
+		return fmt.Errorf("chain %q does not begin with both address dispatchers", whalewallChainName)
+	}
+
+	dockerRules, err := nfc.GetRules(filterTable, dockerChain)
+	if err != nil {
+		return fmt.Errorf("get %q rules: %w", dockerChainName, err)
+	}
+	if len(dockerRules) == 0 || !isUnconditionalJump(dockerRules[0], whalewallChainName) {
+		return fmt.Errorf("chain %q does not begin with a jump to %q", dockerChainName, whalewallChainName)
+	}
+
+	return nil
+}
+
+func checkInitialContainerPolicies(dockerCli *client.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	clientResult, err := dockerCli.ContainerInspect(ctx, "client", client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspect client container: %w", err)
+	}
+	serverResult, err := dockerCli.ContainerInspect(ctx, "server", client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspect server container: %w", err)
+	}
+
+	type expectedPolicy struct {
+		name      string
+		container container.InspectResponse
+		address   netip.Addr
+		chain     *nftables.Chain
+	}
+	policies := make([]expectedPolicy, 0, 2)
+	for _, item := range []struct {
+		name      string
+		container container.InspectResponse
+	}{
+		{name: "client", container: clientResult.Container},
+		{name: "server", container: serverResult.Container},
+	} {
+		if item.container.NetworkSettings == nil {
+			return fmt.Errorf("container %q has no network settings", item.name)
+		}
+		var address netip.Addr
+		for _, endpoint := range item.container.NetworkSettings.Networks {
+			if endpoint != nil && endpoint.IPAddress.Is4() {
+				address = endpoint.IPAddress
+				break
+			}
+		}
+		if !address.Is4() {
+			return fmt.Errorf("container %q has no IPv4 address", item.name)
+		}
+		policies = append(policies, expectedPolicy{
+			name:      item.name,
+			container: item.container,
+			address:   address,
+			chain: &nftables.Chain{
+				Name:  buildChainName(item.name, item.container.ID),
+				Table: filterTable,
+			},
+		})
+	}
+
+	nfc, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("create nftables client: %w", err)
+	}
+	set, err := nfc.GetSetByName(filterTable, containerAddrSetName)
+	if err != nil {
+		return fmt.Errorf("get container address set: %w", err)
+	}
+	elements, err := nfc.GetSetElements(set)
+	if err != nil {
+		return fmt.Errorf("get container address mappings: %w", err)
+	}
+	for _, policy := range policies {
+		mappedChain := ""
+		for _, element := range elements {
+			if !bytes.Equal(element.Key, policy.address.AsSlice()) {
+				continue
+			}
+			verdict, err := containerMappingVerdict(element)
+			if err != nil {
+				return fmt.Errorf("decode %s address mapping: %w", policy.name, err)
+			}
+			mappedChain = verdict.Chain
+			break
+		}
+		if mappedChain != policy.chain.Name {
+			return fmt.Errorf("container %q address %s maps to %q, want %q", policy.name, policy.address, mappedChain, policy.chain.Name)
+		}
+	}
+
+	chains, err := nfc.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return fmt.Errorf("list IPv4 chains: %w", err)
+	}
+	actualChains := make(map[string]*nftables.Chain, len(chains))
+	for _, chain := range chains {
+		if chain.Table != nil && chain.Table.Name == filterTableName {
+			actualChains[chain.Name] = chain
+		}
+	}
+	clientHasServerRule := false
+	logger := zap.NewNop()
+	for _, policy := range policies {
+		chain := actualChains[policy.chain.Name]
+		if chain == nil {
+			return fmt.Errorf("container %q chain %q does not exist", policy.name, policy.chain.Name)
+		}
+		rules, err := nfc.GetRules(filterTable, chain)
+		if err != nil {
+			return fmt.Errorf("get container %q rules: %w", policy.name, err)
+		}
+		if len(rules) == 0 || !rulesEqual(logger, rules[len(rules)-1], createDropRule(chain, policy.container.ID)) {
+			return fmt.Errorf("container %q chain %q does not end with its canonical drop rule", policy.name, policy.chain.Name)
+		}
+		for _, rule := range rules {
+			if policy.name == "client" && string(rule.UserData) == serverResult.Container.ID {
+				clientHasServerRule = true
+			}
+		}
+		if len(rules) == 1 {
+			return fmt.Errorf("container %q chain %q still contains only its fail-closed floor", policy.name, policy.chain.Name)
+		}
+	}
+	if !clientHasServerRule {
+		return fmt.Errorf("client policy has no rule owned by server %s", serverResult.Container.ID)
+	}
+
+	return nil
 }
 
 func checkReplacementPolicy(serverAddr netip.Addr, clientChainName, oldChainName, oldID, newChainName, newID string, requireOldGone, requireReady bool) error {
@@ -350,51 +568,161 @@ func checkReplacementPolicy(serverAddr netip.Addr, clientChainName, oldChainName
 	return nil
 }
 
-func startWhalewall(t *testing.T, is *is.I, tempDir string) func() {
-	t.Helper()
+type whalewallTestProcess struct {
+	t       *testing.T
+	name    string
+	cmd     *exec.Cmd
+	done    chan struct{}
+	waitErr error
+	stopFn  func()
 
-	var stop func()
-	var stopOnce sync.Once
+	stopOnce     sync.Once
+	exitObserved bool
+}
 
-	switch {
-	case *binaryTests:
-		stop = startBinary(t, is, tempDir)
-	case *containerTests:
-		stop = startContainer(t, is, tempDir)
-	default:
-		stop = startFunc(t, is, tempDir)
+func (p *whalewallTestProcess) runningError() error {
+	if p == nil {
+		return errors.New("Whalewall process was not started")
 	}
-
-	return func() {
-		stopOnce.Do(stop)
+	if p.done == nil {
+		return nil
+	}
+	select {
+	case <-p.done:
+		p.exitObserved = true
+		return fmt.Errorf("%s exited unexpectedly: %s", p.name, describeProcessExit(p.waitErr))
+	default:
+		return nil
 	}
 }
 
-func startBinary(t *testing.T, is *is.I, tempDir string) func() {
+func (p *whalewallTestProcess) stop() {
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(func() {
+		if p.stopFn != nil {
+			p.stopFn()
+			return
+		}
+
+		select {
+		case <-p.done:
+			if !p.exitObserved {
+				p.t.Errorf("%s exited before the requested stop: %s", p.name, describeProcessExit(p.waitErr))
+			}
+			return
+		default:
+		}
+
+		if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
+			select {
+			case <-p.done:
+				p.t.Errorf("%s exited while it was being stopped: %s", p.name, describeProcessExit(p.waitErr))
+			default:
+				p.t.Errorf("error stopping %s: %v", p.name, err)
+			}
+			return
+		}
+		select {
+		case <-p.done:
+		case <-time.After(10 * time.Second):
+			p.t.Errorf("timed out stopping %s; killing the test process", p.name)
+			if err := p.cmd.Process.Kill(); err != nil {
+				p.t.Errorf("kill unresponsive %s: %v", p.name, err)
+				return
+			}
+			<-p.done
+		}
+		if p.waitErr != nil {
+			p.t.Errorf("%s exited with error after stop: %s", p.name, describeProcessExit(p.waitErr))
+		}
+	})
+}
+
+func describeProcessExit(err error) string {
+	if err == nil {
+		return "exit status 0"
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return err.Error()
+	}
+	status, ok := exitErr.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok {
+		return err.Error()
+	}
+	if status.Signaled() {
+		return fmt.Sprintf("%v (signal %s)", err, status.Signal())
+	}
+	exitCode := status.ExitStatus()
+	if exitCode >= 128 && exitCode <= 255 {
+		signal := syscall.Signal(exitCode - 128)
+		return fmt.Sprintf("%v (128+%d; conventionally signal %s)", err, exitCode-128, signal)
+	}
+	return err.Error()
+}
+
+func requireWhalewallRunning(t *testing.T, process *whalewallTestProcess) {
+	t.Helper()
+	if err := process.runningError(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startWhalewall(t *testing.T, is *is.I, tempDir string) *whalewallTestProcess {
+	t.Helper()
+
+	var process *whalewallTestProcess
+	switch {
+	case *binaryTests:
+		process = startBinary(t, is, tempDir)
+	case *containerTests:
+		process = startContainer(t, is, tempDir)
+	default:
+		process = startFunc(t, is, tempDir)
+	}
+
+	ready := false
+	defer func() {
+		if !ready {
+			process.stop()
+		}
+	}()
+	waitForIntegrationState(t, "Whalewall base policy", process, checkBasePolicyReady)
+	ready = true
+	return process
+}
+
+func startExternalWhalewall(t *testing.T, name string, cmd *exec.Cmd) *whalewallTestProcess {
+	t.Helper()
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", name, err)
+	}
+	process := &whalewallTestProcess{
+		t:    t,
+		name: name,
+		cmd:  cmd,
+		done: make(chan struct{}),
+	}
+	go func() {
+		process.waitErr = cmd.Wait()
+		close(process.done)
+	}()
+	return process
+}
+
+func startBinary(t *testing.T, _ *is.I, tempDir string) *whalewallTestProcess {
 	t.Helper()
 
 	wwCmd := exec.Command(*whalewallBinary, "-debug", "-d", tempDir)
-	wwCmd.Stdout = os.Stdout
-	wwCmd.Stderr = os.Stderr
-	err := wwCmd.Start()
-	is.NoErr(err)
-
-	return func() {
-		err := wwCmd.Process.Signal(os.Interrupt)
-		if err != nil {
-			t.Errorf("error killing whalewall process: %v", err)
-		}
-
-		if err := wwCmd.Wait(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				t.Errorf("whalewall exited with error: %v", err)
-			}
-		}
-	}
+	return startExternalWhalewall(t, "Whalewall binary", wwCmd)
 }
 
-func startContainer(t *testing.T, is *is.I, tempDir string) func() {
+func startContainer(t *testing.T, _ *is.I, tempDir string) *whalewallTestProcess {
 	t.Helper()
 
 	dockerCmd := exec.Command(
@@ -409,27 +737,10 @@ func startContainer(t *testing.T, is *is.I, tempDir string) func() {
 		"-d=/data",
 		"-debug",
 	)
-	dockerCmd.Stdout = os.Stdout
-	dockerCmd.Stderr = os.Stderr
-	err := dockerCmd.Start()
-	is.NoErr(err)
-
-	return func() {
-		err := dockerCmd.Process.Signal(os.Interrupt)
-		if err != nil {
-			t.Errorf("error killing whalewall container: %v", err)
-		}
-
-		if err := dockerCmd.Wait(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				t.Errorf("whalewall container exited with error: %v", err)
-			}
-		}
-	}
+	return startExternalWhalewall(t, "Whalewall container", dockerCmd)
 }
 
-func startFunc(t *testing.T, is *is.I, tempDir string) func() {
+func startFunc(t *testing.T, is *is.I, tempDir string) *whalewallTestProcess {
 	t.Helper()
 
 	logger, err := zap.NewDevelopment()
@@ -443,10 +754,14 @@ func startFunc(t *testing.T, is *is.I, tempDir string) func() {
 	err = r.Start(ctx)
 	is.NoErr(err)
 
-	return func() {
-		logger.Info("stopping whalewall")
-		cancel()
-		r.Stop()
+	return &whalewallTestProcess{
+		t:    t,
+		name: "in-process Whalewall",
+		stopFn: func() {
+			logger.Info("stopping whalewall")
+			cancel()
+			r.Stop()
+		},
 	}
 }
 
@@ -2017,8 +2332,8 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					srcJumpRule,
-					dstJumpRule,
+					createSourceDispatcherRule(),
+					createDestinationDispatcherRule(),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),

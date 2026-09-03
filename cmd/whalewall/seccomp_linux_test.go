@@ -91,9 +91,32 @@ func exerciseSeccompRuntime(dbPath string) error {
 	if _, err = conn.ExecContext(ctx, "PRAGMA shrink_memory"); err != nil {
 		return fmt.Errorf("release SQLite page cache: %w", err)
 	}
+	peekSockets, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("create recvmsg probe socket pair: %w", err)
+	}
+	const peekPayload = "netlink-buffer-size-probe"
+	if _, err = unix.Write(peekSockets[0], []byte(peekPayload)); err != nil {
+		return fmt.Errorf("write recvmsg probe datagram: %w", err)
+	}
 
 	if _, err = installSeccompFilters(); err != nil {
 		return fmt.Errorf("install seccomp filter: %w", err)
+	}
+	// mdlayher/netlink v1.11+ discovers a datagram's required buffer size with
+	// this exact flag combination. Keep it in the post-filter regression so a
+	// dependency update cannot silently kill live nftables reads.
+	peeked, _, _, _, err := unix.Recvmsg(peekSockets[1], nil, nil, unix.MSG_PEEK|unix.MSG_TRUNC)
+	if err != nil {
+		return fmt.Errorf("peek recvmsg datagram length after installing seccomp: %w", err)
+	}
+	if peeked != len(peekPayload) {
+		return fmt.Errorf("peeked recvmsg datagram length = %d, want %d", peeked, len(peekPayload))
+	}
+	for _, fd := range peekSockets {
+		if err = unix.Close(fd); err != nil {
+			return fmt.Errorf("close recvmsg probe socket: %w", err)
+		}
 	}
 
 	// SQLite maps later WAL-index regions at nonzero page-aligned offsets.
@@ -127,6 +150,29 @@ func exerciseSeccompRuntime(dbPath string) error {
 	}
 	if err = unix.SetsockoptInt(socketFD, unix.SOL_TCP, unix.TCP_KEEPCNT, 9); err != nil {
 		return fmt.Errorf("set TCP keepalive count after installing seccomp: %w", err)
+	}
+	// google/nftables checks both netlink socket buffers before each flush and
+	// mdlayher/socket attempts the privileged FORCE variants before falling
+	// back to the ordinary options when enlargement is required.
+	for _, option := range []int{unix.SO_RCVBUF, unix.SO_SNDBUF} {
+		bufferSize, getErr := unix.GetsockoptInt(socketFD, unix.SOL_SOCKET, option)
+		if getErr != nil {
+			return fmt.Errorf("get socket buffer option %d after installing seccomp: %w", option, getErr)
+		}
+		if bufferSize <= 0 {
+			return fmt.Errorf("socket buffer option %d = %d, want a positive size", option, bufferSize)
+		}
+	}
+	for _, option := range []int{unix.SO_RCVBUFFORCE, unix.SO_SNDBUFFORCE} {
+		setErr := unix.SetsockoptInt(socketFD, unix.SOL_SOCKET, option, 1<<20)
+		if setErr != nil && !errors.Is(setErr, unix.EPERM) {
+			return fmt.Errorf("set forced socket buffer option %d after installing seccomp: %w", option, setErr)
+		}
+	}
+	for _, option := range []int{unix.SO_RCVBUF, unix.SO_SNDBUF} {
+		if err = unix.SetsockoptInt(socketFD, unix.SOL_SOCKET, option, 1<<20); err != nil {
+			return fmt.Errorf("set socket buffer option %d after installing seccomp: %w", option, err)
+		}
 	}
 	if err = unix.Close(socketFD); err != nil {
 		return fmt.Errorf("close TCP socket after installing seccomp: %w", err)

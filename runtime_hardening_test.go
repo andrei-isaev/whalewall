@@ -32,6 +32,39 @@ import (
 
 const hardeningContainerID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+// handleMutatingFirewall mirrors google/nftables behavior: successful rule
+// creation replies populate Handle on the exact Rule pointer submitted by the
+// caller. The regular mock stores a copy, so this wrapper catches accidental
+// reuse of a previously submitted rule as a new rule.
+type handleMutatingFirewall struct {
+	firewallClient
+	pending    []*nftables.Rule
+	nextHandle uint64
+}
+
+func (m *handleMutatingFirewall) AddRule(rule *nftables.Rule) *nftables.Rule {
+	m.pending = append(m.pending, rule)
+	return m.firewallClient.AddRule(rule)
+}
+
+func (m *handleMutatingFirewall) InsertRule(rule *nftables.Rule) *nftables.Rule {
+	m.pending = append(m.pending, rule)
+	return m.firewallClient.InsertRule(rule)
+}
+
+func (m *handleMutatingFirewall) Flush() error {
+	if err := m.firewallClient.Flush(); err != nil {
+		return err
+	}
+	for _, rule := range m.pending {
+		m.nextHandle++
+		rule.Handle = m.nextHandle
+		rule.ID = 0
+	}
+	m.pending = nil
+	return nil
+}
+
 func TestValidateBridgeNetfilter(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -134,7 +167,9 @@ func TestContainerMappingVerdictDecodesKernelReadback(t *testing.T) {
 	if _, err := containerMappingVerdict(nftables.SetElement{VerdictData: &expr.Verdict{Kind: expr.VerdictGoto, Chain: whalewallChainName}}); err == nil {
 		t.Fatal("non-container verdict target was accepted as an address mapping")
 	}
-	if _, err := containerMappingVerdict(nftables.SetElement{Val: encoded[:len(encoded)-1]}); err == nil {
+	// Removing one byte can trim only netlink alignment padding. Truncate into
+	// the declared chain attribute so the decoder must reject the message.
+	if _, err := containerMappingVerdict(nftables.SetElement{Val: encoded[:len(encoded)-4]}); err == nil {
 		t.Fatal("truncated kernel verdict was accepted")
 	}
 }
@@ -339,7 +374,7 @@ func TestExistingContainerChainIsQuarantinedAtHeadBeforeReconcile(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if _, err := ensureContainerDropPolicy(firewallCreator.newMockFirewall(), zap.NewNop(), chain, hardeningContainerID, true); err != nil {
+	if err := ensureContainerDropPolicy(firewallCreator.newMockFirewall(), zap.NewNop(), chain, hardeningContainerID, true); err != nil {
 		t.Fatalf("ensureContainerDropPolicy() error = %v", err)
 	}
 	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
@@ -367,13 +402,32 @@ func TestPeriodicReconcileDoesNotPrependTransientDrop(t *testing.T) {
 			handles = append(handles, rule.Handle)
 		}
 	})
-	if _, err := ensureContainerDropPolicy(firewallCreator.newMockFirewall(), zap.NewNop(), chain, hardeningContainerID, false); err != nil {
+	if err := ensureContainerDropPolicy(firewallCreator.newMockFirewall(), zap.NewNop(), chain, hardeningContainerID, false); err != nil {
 		t.Fatal(err)
 	}
 	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
 		got := base.chains[chainName].Rules
 		if len(got) != 2 || got[0].Handle != handles[0] || got[1].Handle != handles[1] {
 			t.Fatalf("periodic floor check churned rules: %#v", got)
+		}
+	})
+}
+
+func TestPolicyReplacementDoesNotReuseMutatedEnforcementFloor(t *testing.T) {
+	r, firewallCreator := newHardeningTestManager(t)
+	r.newFirewallClient = func() (firewallClient, error) {
+		return &handleMutatingFirewall{firewallClient: firewallCreator.newMockFirewall()}, nil
+	}
+
+	if err := r.createContainerRules(context.Background(), hardeningContainer(map[string]string{enabledLabel: "true"}), true); err != nil {
+		t.Fatalf("createContainerRules() with handle mutation: %v", err)
+	}
+
+	chainName := buildChainName("hardening", hardeningContainerID)
+	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
+		chain := base.chains[chainName]
+		if len(chain.Rules) != 1 || !containsVerdict(chain.Rules[0].Exprs, expr.VerdictDrop) {
+			t.Fatalf("authoritative policy = %#v, want one fresh terminal drop", chain.Rules)
 		}
 	})
 }
@@ -564,7 +618,7 @@ func TestBaseRepairPreservesOnlyValidatedOwnedDrops(t *testing.T) {
 	var firstHandles []uint64
 	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
 		rules := base.chains[whalewallChainName].Rules
-		if len(rules) != 3 || !rulesEqual(zap.NewNop(), rules[0], srcJumpRule) || !rulesEqual(zap.NewNop(), rules[1], dstJumpRule) {
+		if len(rules) != 3 || !rulesEqual(zap.NewNop(), rules[0], createSourceDispatcherRule()) || !rulesEqual(zap.NewNop(), rules[1], createDestinationDispatcherRule()) {
 			t.Fatalf("main chain order = %#v, want src,dst,safe-drop", rules)
 		}
 		if !isSafeOwnedDropRule(rules[2]) {
@@ -587,6 +641,38 @@ func TestBaseRepairPreservesOnlyValidatedOwnedDrops(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestBaseRepairDoesNotReuseMutatedDispatcherRules(t *testing.T) {
+	r, firewallCreator := newHardeningTestManager(t)
+	r.newFirewallClient = func() (firewallClient, error) {
+		return &handleMutatingFirewall{firewallClient: firewallCreator.newMockFirewall()}, nil
+	}
+
+	removeDispatchers := func() {
+		nfc := firewallCreator.newMockFirewall()
+		rules, err := nfc.GetRules(filterTable, whalewallChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, rule := range rules {
+			if rulesEqual(zap.NewNop(), rule, createSourceDispatcherRule()) || rulesEqual(zap.NewNop(), rule, createDestinationDispatcherRule()) {
+				if err := nfc.DelRule(rule); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := nfc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for attempt := range 2 {
+		removeDispatchers()
+		if err := r.createBaseRules(); err != nil {
+			t.Fatalf("dispatcher repair attempt %d: %v", attempt+1, err)
+		}
+	}
 }
 
 func TestBaseRepairRejectsLegacyJumpMappingWithoutMutation(t *testing.T) {
