@@ -267,9 +267,9 @@ Configuration is decoded strictly. In particular:
 - Ports and port-range endpoints must be between 1 and 65535; a range's start cannot exceed its end.
 - IP addresses, CIDRs, and ranges must be IPv4. IPv6 values are rejected rather than partially
   configuring a policy.
-- Publish host ports on an explicit IPv4 address, for example
-  `0.0.0.0:443:443/tcp` or `127.0.0.1:8080:8080/tcp`. An IPv6 host binding such as `[::]:443:443`
-  is rejected. Also keep Docker and every managed network's IPv6 setting disabled.
+- For published ports whose selected endpoint is managed, use an explicit IPv4 host address, for
+  example `0.0.0.0:443:443/tcp` or `127.0.0.1:8080:8080/tcp`. An IPv6 host binding such as
+  `[::]:443:443` is rejected. Also keep Docker and every managed network's IPv6 setting disabled.
 - Custom `verdict.chain` and NFQUEUE verdicts are rejected in this hardened fork. An `ACCEPT` from
   either path can terminate the host firewall hook before Docker's own bridge-isolation rules run.
 - A broad IP rule such as `0.0.0.0/0` includes RFC1918, host, and Docker address ranges; it does not
@@ -278,16 +278,19 @@ Configuration is decoded strictly. In particular:
 - `mapped_ports` controls Docker-published host ports. Direct traffic between containers on a bridge
   network is allowed with an `output` rule that names the destination container. An unmanaged peer
   on the same bridge can also resemble "external" mapped-port traffic, so every member of a shared
-  protected bridge must be managed or isolated on a separate edge network. With an explicit scope,
-  host published-port localhost rules are installed only when Docker's selected IPv4 gateway endpoint
-  is managed; published ports routed through an unmanaged gateway endpoint remain untouched. For the
-  supported IPv4 bridge setup, Docker selects the highest `gw_priority` among IPv4 gateway-capable
-  endpoints and uses the actual network name as a tie-breaker. For WhaleWall, set `gw_priority` only
-  on a container that publishes host ports with `ports:` and has more than one IPv4 gateway-capable
-  network. Give the managed network the higher priority when its published ports should be covered
-  by WhaleWall. Containers without `ports:`—including containers that use only `expose:`—do not need
-  `gw_priority` for WhaleWall; `managed_networks` is sufficient. You may still set `gw_priority`
-  independently when you need to choose the container's default outbound gateway.
+  protected bridge must be managed or isolated on a separate edge network. For the supported ordinary
+  IPv4 bridge/NAT setup, an explicit scope generates mapped-port policy only for Docker's selected
+  IPv4 gateway endpoint and only when that endpoint is managed. If the selected endpoint is unmanaged,
+  every published-port binding is outside WhaleWall's scope and is left unvalidated and untouched,
+  including a Docker-reported IPv6 `::` binding. Failure to identify the selected IPv4 gateway still
+  fails closed. Custom bridge gateway modes are outside this supported profile. Docker selects the
+  highest `gw_priority` among IPv4 gateway-capable endpoints and uses the actual network name as a
+  tie-breaker. For WhaleWall, set `gw_priority` only on a container that publishes host ports with
+  `ports:` and has more than one IPv4 gateway-capable network. Give the managed network the higher
+  priority when its published ports should be covered by WhaleWall.
+  Containers without `ports:`—including containers that use only `expose:`—do not need `gw_priority`
+  for WhaleWall; `managed_networks` is sufficient. You may still set `gw_priority` independently when
+  you need to choose the container's default outbound gateway.
 
 ### Reverse proxy isolation
 

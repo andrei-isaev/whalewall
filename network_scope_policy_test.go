@@ -363,12 +363,12 @@ func TestContainerListWaitingRuleHonorsDestinationScope(t *testing.T) {
 	}
 }
 
-func TestScopedMappedPortsUseManagedIPv4GatewayEndpoint(t *testing.T) {
+func TestScopedMappedPortsUseOnlySelectedManagedIPv4GatewayEndpoint(t *testing.T) {
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
 	cont.NetworkSettings.Ports = network.PortMap{
 		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
 	}
-	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
+	managed := cont.NetworkSettings.Networks
 	rules, err := (&RuleManager{}).createPortMappingRules(
 		&setRecordingFirewall{},
 		zap.NewNop(),
@@ -376,7 +376,10 @@ func TestScopedMappedPortsUseManagedIPv4GatewayEndpoint(t *testing.T) {
 		"source",
 		mappedPorts{External: externalRules{Allow: true}},
 		managed,
-		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
+		map[string][]byte{
+			"demo_proxy":      {172, 30, 0, 2},
+			"demo_monitoring": {172, 31, 0, 2},
+		},
 		&nftables.Chain{Name: "source", Table: filterTable},
 		true,
 	)
@@ -385,6 +388,20 @@ func TestScopedMappedPortsUseManagedIPv4GatewayEndpoint(t *testing.T) {
 	}
 	if len(rules) != 4 {
 		t.Fatalf("scoped mapped-port rule count = %d; want gateway drop, host published-port drop, and two external rules for the selected IPv4 gateway endpoint", len(rules))
+	}
+	var proxyAddrFound, monitoringAddrFound bool
+	for _, rule := range rules {
+		for _, expression := range rule.Exprs {
+			comparison, ok := expression.(*expr.Cmp)
+			if !ok {
+				continue
+			}
+			proxyAddrFound = proxyAddrFound || bytes.Equal(comparison.Data, []byte{172, 30, 0, 2})
+			monitoringAddrFound = monitoringAddrFound || bytes.Equal(comparison.Data, []byte{172, 31, 0, 2})
+		}
+	}
+	if !proxyAddrFound || monitoringAddrFound {
+		t.Fatalf("mapped-port endpoint addresses: proxy=%t monitoring=%t; want only proxy", proxyAddrFound, monitoringAddrFound)
 	}
 	if !containsVerdict(rules[0].Exprs, expr.VerdictDrop) {
 		t.Fatalf("first scoped mapped-port rule does not deny localhost before external allows: %#v", rules[0])
@@ -403,14 +420,16 @@ func TestScopedMappedPortsUseManagedIPv4GatewayEndpoint(t *testing.T) {
 	}
 }
 
-func TestScopedMappedPortsSkipManagedEndpointWithoutIPv4Gateway(t *testing.T) {
+func TestScopedMappedPortsRejectIPv6BindingForManagedIPv4GatewayEndpoint(t *testing.T) {
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
-	cont.NetworkSettings.Networks["demo_proxy"].Gateway = netip.Addr{}
 	cont.NetworkSettings.Ports = network.PortMap{
-		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
+		network.MustParsePort("80/tcp"): {
+			{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"},
+			{HostIP: netip.MustParseAddr("::"), HostPort: "8080"},
+		},
 	}
 	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
-	rules, err := (&RuleManager{}).createPortMappingRules(
+	_, err := (&RuleManager{}).createPortMappingRules(
 		&setRecordingFirewall{},
 		zap.NewNop(),
 		cont,
@@ -421,16 +440,40 @@ func TestScopedMappedPortsSkipManagedEndpointWithoutIPv4Gateway(t *testing.T) {
 		&nftables.Chain{Name: "source", Table: filterTable},
 		true,
 	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported IPv6 published HostIP") {
+		t.Fatalf("createPortMappingRules() error = %v; want managed IPv6 binding rejection", err)
+	}
+}
+
+func TestScopedMappedPortsIgnoreBindingsForUnmanagedIPv4GatewayEndpoint(t *testing.T) {
+	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
+	cont.NetworkSettings.Networks["demo_proxy"].Gateway = netip.Addr{}
+	cont.NetworkSettings.Ports = network.PortMap{
+		network.MustParsePort("80/tcp"): {
+			{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"},
+			{HostIP: netip.MustParseAddr("::"), HostPort: "8080"},
+		},
+	}
+	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
+	rules, err := (&RuleManager{}).createPortMappingRules(
+		&setRecordingFirewall{},
+		zap.NewNop(),
+		cont,
+		"source",
+		mappedPorts{
+			Localhost: localRules{Allow: true},
+			External:  externalRules{Allow: true},
+		},
+		managed,
+		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
+		&nftables.Chain{Name: "source", Table: filterTable},
+		true,
+	)
 	if err != nil {
 		t.Fatalf("createPortMappingRules() error = %v", err)
 	}
-	if len(rules) != 2 {
-		t.Fatalf("rules without a managed gateway = %d; want only two selected-network external rules", len(rules))
-	}
-	for _, rule := range rules {
-		if rule.Chain.Name == whalewallChainName {
-			t.Fatalf("endpoint without an IPv4 gateway received a host published-port rule: %#v", rule)
-		}
+	if len(rules) != 0 {
+		t.Fatalf("mapped-port rules for unmanaged gateway endpoint = %d; want 0", len(rules))
 	}
 }
 
@@ -448,7 +491,10 @@ func TestScopedMappedPortsFailClosedWithoutIPv4GatewayEndpoint(t *testing.T) {
 		zap.NewNop(),
 		cont,
 		"source",
-		mappedPorts{External: externalRules{Allow: true}},
+		mappedPorts{
+			Localhost: localRules{Allow: true},
+			External:  externalRules{Allow: true},
+		},
 		managed,
 		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
 		&nftables.Chain{Name: "source", Table: filterTable},
@@ -524,31 +570,58 @@ func TestDockerIPv4GatewayNetworkName(t *testing.T) {
 	}
 }
 
-func TestScopedMappedPortsLeaveUnmanagedIPv4GatewayEndpointUntouched(t *testing.T) {
-	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", nil)
-	cont.NetworkSettings.Networks["demo_monitoring"].GwPriority = 2
+func TestScopedUnmanagedPublishedBindingsDoNotQuarantineOutputPolicy(t *testing.T) {
+	r, firewallCreator := newHardeningTestManager(t)
+	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", map[string]string{
+		enabledLabel:         "true",
+		managedNetworksLabel: "proxy",
+		rulesLabel: `output:
+  - network: proxy
+    ips: [172.30.0.3]
+    proto: tcp
+    dst_ports: [8123]
+`,
+	})
+	cont.NetworkSettings.Networks["demo_proxy"].Gateway = netip.Addr{}
+	cont.NetworkSettings.Networks["demo_wan"] = &network.EndpointSettings{
+		NetworkID: "wan-network-id",
+		Gateway:   netip.MustParseAddr("172.32.0.1"),
+		IPAddress: netip.MustParseAddr("172.32.0.2"),
+	}
 	cont.NetworkSettings.Ports = network.PortMap{
-		network.MustParsePort("80/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"}},
+		network.MustParsePort("80/tcp"): {
+			{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "8080"},
+			{HostIP: netip.MustParseAddr("::"), HostPort: "8080"},
+		},
 	}
-	managed := map[string]*network.EndpointSettings{"demo_proxy": cont.NetworkSettings.Networks["demo_proxy"]}
-	rules, err := (&RuleManager{}).createPortMappingRules(
-		&setRecordingFirewall{},
-		zap.NewNop(),
-		cont,
-		"source",
-		mappedPorts{External: externalRules{Allow: true}},
-		managed,
-		map[string][]byte{"demo_proxy": {172, 30, 0, 2}},
-		&nftables.Chain{Name: "source", Table: filterTable},
-		true,
-	)
-	if err != nil {
-		t.Fatalf("createPortMappingRules() error = %v", err)
+
+	if err := r.createContainerRules(context.Background(), cont, true); err != nil {
+		t.Fatalf("create scoped output policy with unmanaged published endpoint: %v", err)
 	}
-	for _, rule := range rules {
-		if rule.Chain.Name == whalewallChainName {
-			t.Fatalf("unmanaged gateway endpoint received a host published-port rule: %#v", rule)
+	assertMappedAddresses(t, firewallCreator, map[string]string{
+		"172.30.0.2": buildChainName("source", scopeSourceID),
+	})
+	assertSourceDatabaseAddresses(t, r, "172.30.0.2")
+	assertSourceMainChainRuleCount(t, firewallCreator, 0)
+
+	var outputRuleFound bool
+	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
+		chain := base.chains[buildChainName("source", scopeSourceID)]
+		for _, rule := range chain.Rules {
+			if !containsVerdict(rule.Exprs, expr.VerdictReturn) {
+				continue
+			}
+			for _, expression := range rule.Exprs {
+				comparison, ok := expression.(*expr.Cmp)
+				if ok && bytes.Equal(comparison.Data, []byte{172, 30, 0, 3}) {
+					outputRuleFound = true
+					break
+				}
+			}
 		}
+	})
+	if !outputRuleFound {
+		t.Fatal("managed output policy was replaced by quarantine drop")
 	}
 }
 
@@ -576,7 +649,7 @@ func TestNarrowingScopeReplacesLegacyGlobalMappedPortRules(t *testing.T) {
 	assertSourceMainChainRuleCount(t, firewallCreator, 1)
 }
 
-func TestScopedMappedPortGatewayTransitionRemovesHostRule(t *testing.T) {
+func TestScopedMappedPortGatewayTransitionsReplaceAllMappedPortRules(t *testing.T) {
 	r, firewallCreator := newHardeningTestManager(t)
 	cont := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", map[string]string{
 		enabledLabel:         "true",
@@ -600,6 +673,26 @@ func TestScopedMappedPortGatewayTransitionRemovesHostRule(t *testing.T) {
 		t.Fatalf("move mapped port to unmanaged gateway: %v", err)
 	}
 	assertSourceMainChainRuleCount(t, firewallCreator, 0)
+	assertDropOnlyChain(t, firewallCreator, buildChainName("source", scopeSourceID), scopeSourceID)
+
+	cont.NetworkSettings.Networks["demo_monitoring"].GwPriority = 0
+	if err := r.createContainerRules(context.Background(), cont, false); err != nil {
+		t.Fatalf("move mapped port back to managed gateway: %v", err)
+	}
+	assertSourceMainChainRuleCount(t, firewallCreator, 1)
+	var mappedPortRuleFound bool
+	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
+		chain := base.chains[buildChainName("source", scopeSourceID)]
+		for _, rule := range chain.Rules {
+			if containsVerdict(rule.Exprs, expr.VerdictReturn) {
+				mappedPortRuleFound = true
+				break
+			}
+		}
+	})
+	if !mappedPortRuleFound {
+		t.Fatal("managed mapped-port rules were not restored after the gateway transition")
+	}
 }
 
 func scopedTestContainer(id, name, proxyAddr, monitoringAddr string, labels map[string]string) container.InspectResponse {

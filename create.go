@@ -963,19 +963,28 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 	if mappedPortsCfg.External.LogPrefix != "" {
 		mappedPortsCfg.External.LogPrefix = formatLogPrefix(mappedPortsCfg.External.LogPrefix, contName, container.ID)
 	}
-	var primaryNetwork string
-	if explicitScope && !mappedPortsCfg.Localhost.Allow && hasLocalhostPublishedPort(container.NetworkSettings.Ports) {
+	var publishedNetwork string
+	if explicitScope {
 		var err error
-		primaryNetwork, err = dockerIPv4GatewayNetworkName(container.NetworkSettings.Networks)
+		publishedNetwork, err = dockerIPv4GatewayNetworkName(container.NetworkSettings.Networks)
 		if err != nil {
 			return nil, fmt.Errorf("cannot identify Docker's IPv4 gateway endpoint for scoped mapped-port policy: %w", err)
 		}
+		if _, managed := managedNetworks[publishedNetwork]; !managed {
+			logger.Debug("skipping mapped-port policy for unmanaged Docker gateway endpoint", zap.String("network.name", publishedNetwork))
+			return nil, nil
+		}
 	}
-	_, primaryManaged := managedNetworks[primaryNetwork]
 
 	nftRules := make([]*nftables.Rule, 0, len(managedNetworks))
 	managedNetworkNames := slices.Collect(maps.Keys(managedNetworks))
 	slices.Sort(managedNetworkNames)
+	if explicitScope {
+		// Docker routes a published port through one selected endpoint. Once
+		// that endpoint is known to be managed, apply mapped-port policy only
+		// to its address rather than to every managed attachment.
+		managedNetworkNames = []string{publishedNetwork}
+	}
 	for _, netName := range managedNetworkNames {
 		netSettings := managedNetworks[netName]
 		var gateway netip.Addr
@@ -1065,7 +1074,7 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 					nftRules = append(nftRules, rules...)
 				}
 
-				if !localAllowed && (!explicitScope || (primaryManaged && netName == primaryNetwork)) {
+				if !localAllowed && (!explicitScope || netName == publishedNetwork) {
 					// Create rule to drop traffic going to the mapped
 					// host port. This will prevent traffic originating
 					// from localhost to be seen by Docker at all. With
@@ -1179,17 +1188,6 @@ func dockerIPv4GatewayNetworkName(networks map[string]*network.EndpointSettings)
 		return "", errors.New("no attached IPv4 gateway-capable endpoint")
 	}
 	return primary, nil
-}
-
-func hasLocalhostPublishedPort(ports network.PortMap) bool {
-	for _, bindings := range ports {
-		for _, binding := range bindings {
-			if binding.HostIP.IsValid() && (binding.HostIP.IsUnspecified() || binding.HostIP == localAddr) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // createOutputRules adds nftables rules to allow outbound access from
