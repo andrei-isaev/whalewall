@@ -1678,255 +1678,6 @@ output:
 			},
 		},
 		{
-			name: "verdict with queue",
-			containers: []container.InspectResponse{
-				{
-					ID:   cont1ID,
-					Name: "/" + cont1Name,
-					Config: &container.Config{
-						Labels: map[string]string{
-							enabledLabel: "true",
-							rulesLabel: `
-output:
-  - proto: tcp
-    dst_ports:
-      - 443
-    verdict:
-      queue: 1000`,
-						},
-					},
-					NetworkSettings: &container.NetworkSettings{
-						Networks: map[string]*network.EndpointSettings{
-							"default": {
-								Gateway:   gatewayAddr,
-								IPAddress: cont1Addr,
-							},
-						},
-					},
-				},
-			},
-			expectedRules: map[*nftables.Chain][]*nftables.Rule{
-				{
-					Name:  buildChainName(cont1Name, cont1ID),
-					Table: filterTable,
-				}: {
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateNew),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1000,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								allowReturnVerdict,
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, srcPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								allowReturnVerdict,
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					createDropRule(
-						&nftables.Chain{
-							Name:  buildChainName(cont1Name, cont1ID),
-							Table: filterTable,
-						},
-						cont1ID,
-					),
-				},
-			},
-		},
-		{
-			name: "verdict with queue and est queues",
-			containers: []container.InspectResponse{
-				{
-					ID:   cont1ID,
-					Name: "/" + cont1Name,
-					Config: &container.Config{
-						Labels: map[string]string{
-							enabledLabel: "true",
-							rulesLabel: `
-output:
-  - proto: tcp
-    dst_ports:
-      - 443
-    verdict:
-      queue: 1000
-      input_est_queue: 1001
-      output_est_queue: 1002`,
-						},
-					},
-					NetworkSettings: &container.NetworkSettings{
-						Networks: map[string]*network.EndpointSettings{
-							"default": {
-								Gateway:   gatewayAddr,
-								IPAddress: cont1Addr,
-							},
-						},
-					},
-				},
-			},
-			expectedRules: map[*nftables.Chain][]*nftables.Rule{
-				{
-					Name:  buildChainName(cont1Name, cont1ID),
-					Table: filterTable,
-				}: {
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateNew),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1000,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1002,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, srcPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1001,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					createDropRule(
-						&nftables.Chain{
-							Name:  buildChainName(cont1Name, cont1ID),
-							Table: filterTable,
-						},
-						cont1ID,
-					),
-				},
-			},
-		},
-		{
-			name: "verdict with queue and same output est queue",
-			containers: []container.InspectResponse{
-				{
-					ID:   cont1ID,
-					Name: "/" + cont1Name,
-					Config: &container.Config{
-						Labels: map[string]string{
-							enabledLabel: "true",
-							rulesLabel: `
-output:
-  - proto: tcp
-    dst_ports:
-      - 443
-    verdict:
-      queue: 1000
-      input_est_queue: 1001
-      output_est_queue: 1000`,
-						},
-					},
-					NetworkSettings: &container.NetworkSettings{
-						Networks: map[string]*network.EndpointSettings{
-							"default": {
-								Gateway:   gatewayAddr,
-								IPAddress: cont1Addr,
-							},
-						},
-					},
-				},
-			},
-			expectedRules: map[*nftables.Chain][]*nftables.Rule{
-				{
-					Name:  buildChainName(cont1Name, cont1ID),
-					Table: filterTable,
-				}: {
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateNewEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1000,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_TCP),
-							matchPortExprs(443, srcPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1001,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					createDropRule(
-						&nftables.Chain{
-							Name:  buildChainName(cont1Name, cont1ID),
-							Table: filterTable,
-						},
-						cont1ID,
-					),
-				},
-			},
-		},
-		{
 			name: "allow access to container",
 			containers: []container.InspectResponse{
 				{
@@ -2306,6 +2057,8 @@ mapped_ports:
 			},
 			expectedRules: map[*nftables.Chain][]*nftables.Rule{
 				whalewallChain: {
+					createSourceDispatcherRule(),
+					createDestinationDispatcherRule(),
 					{
 						Exprs: slicesJoin(
 							matchAddrExprs(ref(localAddr.As4())[:], srcAddrOffset),
@@ -2332,8 +2085,6 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					createSourceDispatcherRule(),
-					createDestinationDispatcherRule(),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),
@@ -2646,184 +2397,6 @@ mapped_ports:
 				},
 			},
 		},
-		{
-			name: "allow localhost access to mapped ports with queue",
-			containers: []container.InspectResponse{
-				{
-					ID:   cont1ID,
-					Name: "/" + cont1Name,
-					Config: &container.Config{
-						Labels: map[string]string{
-							enabledLabel: "true",
-							rulesLabel: `
-mapped_ports:
-  localhost:
-    allow: true
-    verdict:
-      queue: 1000`,
-						},
-					},
-					NetworkSettings: &container.NetworkSettings{
-						Ports: network.PortMap{
-							network.MustParsePort("443/udp"): []network.PortBinding{
-								{
-									HostIP:   netip.MustParseAddr("0.0.0.0"),
-									HostPort: "8443",
-								},
-							},
-						},
-						Networks: map[string]*network.EndpointSettings{
-							"default": {
-								Gateway:   gatewayAddr,
-								IPAddress: cont1Addr,
-							},
-						},
-					},
-				},
-			},
-			expectedRules: map[*nftables.Chain][]*nftables.Rule{
-				{
-					Name:  buildChainName(cont1Name, cont1ID),
-					Table: filterTable,
-				}: {
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(gatewayAddr.As4())[:], srcAddrOffset),
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_UDP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateNew),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1000,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(gatewayAddr.As4())[:], srcAddrOffset),
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_UDP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								allowReturnVerdict,
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchAddrExprs(ref(gatewayAddr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_UDP),
-							matchPortExprs(443, srcPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								allowReturnVerdict,
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					createDropRule(
-						&nftables.Chain{
-							Name:  buildChainName(cont1Name, cont1ID),
-							Table: filterTable,
-						},
-						cont1ID,
-					),
-				},
-			},
-		},
-		{
-			name: "allow localhost access to mapped ports with same input est queue",
-			containers: []container.InspectResponse{
-				{
-					ID:   cont1ID,
-					Name: "/" + cont1Name,
-					Config: &container.Config{
-						Labels: map[string]string{
-							enabledLabel: "true",
-							rulesLabel: `
-mapped_ports:
-  localhost:
-    allow: true
-    verdict:
-      queue: 1000
-      input_est_queue: 1000
-      output_est_queue: 1001`,
-						},
-					},
-					NetworkSettings: &container.NetworkSettings{
-						Ports: network.PortMap{
-							network.MustParsePort("443/udp"): []network.PortBinding{
-								{
-									HostIP:   netip.MustParseAddr("0.0.0.0"),
-									HostPort: "8443",
-								},
-							},
-						},
-						Networks: map[string]*network.EndpointSettings{
-							"default": {
-								Gateway:   gatewayAddr,
-								IPAddress: cont1Addr,
-							},
-						},
-					},
-				},
-			},
-			expectedRules: map[*nftables.Chain][]*nftables.Rule{
-				{
-					Name:  buildChainName(cont1Name, cont1ID),
-					Table: filterTable,
-				}: {
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(gatewayAddr.As4())[:], srcAddrOffset),
-							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_UDP),
-							matchPortExprs(443, dstPortOffset),
-							matchConnStateExprs(stateNewEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1000,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					{
-						Exprs: slicesJoin(
-							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
-							matchAddrExprs(ref(gatewayAddr.As4())[:], dstAddrOffset),
-							matchProtoExprs(unix.IPPROTO_UDP),
-							matchPortExprs(443, srcPortOffset),
-							matchConnStateExprs(stateEst),
-							[]expr.Any{
-								&expr.Counter{},
-								&expr.Queue{
-									Num: 1001,
-								},
-							},
-						),
-						UserData: []byte(cont1ID),
-					},
-					createDropRule(
-						&nftables.Chain{
-							Name:  buildChainName(cont1Name, cont1ID),
-							Table: filterTable,
-						},
-						cont1ID,
-					),
-				},
-			},
-		},
 	}
 
 	is := is.New(t)
@@ -2984,7 +2557,11 @@ mapped_ports:
 					// reverse order of all expected rules except the
 					// drop rule (which will always be last)
 					for chain, rules := range tt.expectedRules {
-						reverse(rules[:len(rules)-1])
+						if chain.Name == whalewallChainName {
+							reverse(rules[2:])
+						} else {
+							reverse(rules[:len(rules)-1])
+						}
 						tt.expectedRules[chain] = rules
 					}
 
@@ -3260,7 +2837,7 @@ output:
 
 type dbOnCommit struct {
 	database.DB
-	onCommit func(database.TX) error
+	onCommit func(context.Context, database.TX) error
 }
 
 func (d *dbOnCommit) Begin(ctx context.Context, logger *zap.Logger) (database.TX, error) {
@@ -3269,8 +2846,10 @@ func (d *dbOnCommit) Begin(ctx context.Context, logger *zap.Logger) (database.TX
 		return nil, err
 	}
 	return &txOnCommit{
-		TX:       tx,
-		onCommit: d.onCommit,
+		TX: tx,
+		onCommit: func(tx database.TX) error {
+			return d.onCommit(ctx, tx)
+		},
 	}, nil
 }
 
@@ -3320,14 +2899,20 @@ output:
 	is.NoErr(err)
 
 	// configure database to pause before committing so we can cancel
-	// the context
-	committing := make(chan struct{})
-	done := make(chan struct{})
+	// the exact context used by the selected transaction. Other commits must
+	// pass through so cancellation cleanup cannot deadlock behind this hook.
+	pauseNextCommit := make(chan struct{}, 1)
+	committing := make(chan context.Context)
+	continueCommit := make(chan struct{})
 	r.db = &dbOnCommit{
 		DB: r.db,
-		onCommit: func(tx database.TX) error {
-			committing <- struct{}{}
-			<-done
+		onCommit: func(ctx context.Context, tx database.TX) error {
+			select {
+			case <-pauseNextCommit:
+				committing <- ctx
+				<-continueCommit
+			default:
+			}
 			return tx.Commit()
 		},
 	}
@@ -3360,16 +2945,16 @@ output:
 	t.Run("cancel", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		pauseNextCommit <- struct{}{}
+		createDone := make(chan error, 1)
 
 		// create rules
 		go func() {
-			err = r.createContainerRules(ctx, cont, true)
-			is.True(errors.Is(err, context.Canceled))
-			done <- struct{}{}
+			createDone <- r.createContainerRules(ctx, cont, true)
 		}()
 
 		// wait until database transaction is about to be committed
-		<-committing
+		commitCtx := <-committing
 
 		// check that rules were created
 		chainName := buildChainName(cont1Name, cont1ID)
@@ -3383,28 +2968,30 @@ output:
 
 		// let database transaction error out
 		cancel()
-		done <- struct{}{}
+		<-commitCtx.Done()
+		continueCommit <- struct{}{}
 		// wait for rules cleanup to finish
-		<-done
+		createErr := <-createDone
+		is.True(errors.Is(createErr, context.Canceled))
 
-		// check that container chain was deleted
-		_, err = mfc.GetRules(filterTable, chain)
-		is.True(errors.Is(err, syscall.ENOENT))
+		// Manager cancellation preserves the enforcement floor so traffic stays
+		// fail closed until reconciliation or an explicit Docker deletion.
+		rules, err = mfc.GetRules(filterTable, chain)
+		is.NoErr(err)
+		is.True(len(rules) == 1 && rulesEqual(logger, rules[0], createDropRule(chain, cont1ID)))
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
+		pauseNextCommit <- struct{}{}
+		createDone := make(chan error, 1)
 
 		// create rules
 		go func() {
-			err = r.createContainerRules(ctx, cont, true)
-			is.True(errors.Is(err, context.Canceled))
-			done <- struct{}{}
+			createDone <- r.createContainerRules(context.Background(), cont, true)
 		}()
 
 		// wait until database transaction is about to be committed
-		<-committing
+		commitCtx := <-committing
 
 		// check that rules were created
 		chainName := buildChainName(cont1Name, cont1ID)
@@ -3416,12 +3003,17 @@ output:
 		is.NoErr(err)
 		is.True(len(rules) != 0)
 
-		// let database transaction error out
-		err = r.deleteContainerRules(context.Background(), cont1ID, cont1Name)
-		is.NoErr(err)
-		done <- struct{}{}
-		// wait for rules cleanup to finish
-		<-done
+		// Deletion cancels the tracked creator and waits for its cleanup. Observe
+		// that cancellation before releasing the deliberately paused commit.
+		deleteDone := make(chan error, 1)
+		go func() {
+			deleteDone <- r.deleteContainerRules(context.Background(), cont1ID, cont1Name)
+		}()
+		<-commitCtx.Done()
+		continueCommit <- struct{}{}
+		createErr := <-createDone
+		is.True(errors.Is(createErr, context.Canceled))
+		is.NoErr(<-deleteDone)
 
 		// check that container chain was deleted
 		_, err = mfc.GetRules(filterTable, chain)

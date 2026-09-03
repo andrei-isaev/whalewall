@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"slices"
 	"strings"
@@ -699,16 +700,27 @@ func clone[T any](t T) T {
 }
 
 var mockCopyConfig = func() copystructure.Config {
-	copiers := make(map[reflect.Type]copystructure.CopierFunc, len(copystructure.Copiers)+1)
+	copiers := make(map[reflect.Type]copystructure.CopierFunc, len(copystructure.Copiers)+2)
 	for typ, copier := range copystructure.Copiers {
 		copiers[typ] = copier
 	}
+	// Addr is an immutable value whose representation consists of unexported
+	// fields. Preserve it as a unit when cloning Docker 29 API values.
+	copiers[reflect.TypeOf(netip.Addr{})] = copyNetipAddr
 	// SetDatatype contains nftMagic, an unexported field used by nftables to
 	// distinguish kernel datatypes. copystructure cannot reflect-copy that
 	// field, so preserve this immutable value as a unit in the firewall mock.
 	copiers[reflect.TypeOf(nftables.SetDatatype{})] = copyNftablesSetDatatype
 	return copystructure.Config{Copiers: copiers}
 }()
+
+func copyNetipAddr(value any) (any, error) {
+	addr, ok := value.(netip.Addr)
+	if !ok {
+		return nil, fmt.Errorf("copy netip address from %T", value)
+	}
+	return addr, nil
+}
 
 func copyNftablesSetDatatype(value any) (any, error) {
 	datatype, ok := value.(nftables.SetDatatype)
