@@ -720,6 +720,72 @@ func TestBaseRepairRejectsLegacyJumpMappingWithoutMutation(t *testing.T) {
 	})
 }
 
+func TestContainerAddressSetSchemaComparisonUsesKernelSemantics(t *testing.T) {
+	desired := containerAddressSet()
+	kernelNormalized := *desired
+	kernelNormalized.Table = &nftables.Table{Name: filterTableName, Family: nftables.TableFamilyIPv4}
+	kernelNormalized.KeyType.Name = ""
+	kernelNormalized.DataType.Name = ""
+	for _, verdictBytes := range []uint32{8, 16} {
+		kernelNormalized.DataType.Bytes = verdictBytes
+		if !containerAddressSetSchemaEqual(&kernelNormalized, desired) {
+			t.Fatalf("kernel-normalized verdict map with %d-byte verdict was rejected", verdictBytes)
+		}
+	}
+	nonVerdictDesired := *desired
+	nonVerdictDesired.DataType = nftables.TypeInteger
+	nonVerdictActual := nonVerdictDesired
+	nonVerdictActual.DataType.Bytes++
+	if containerAddressSetSchemaEqual(&nonVerdictActual, &nonVerdictDesired) {
+		t.Fatal("non-verdict map with an incompatible data width was accepted")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*nftables.Set)
+	}{
+		{
+			name: "wrong table family",
+			mutate: func(set *nftables.Set) {
+				set.Table = &nftables.Table{Name: filterTableName, Family: nftables.TableFamilyIPv6}
+			},
+		},
+		{
+			name: "wrong key type",
+			mutate: func(set *nftables.Set) {
+				set.KeyType = nftables.TypeIP6Addr
+			},
+		},
+		{
+			name: "wrong key width",
+			mutate: func(set *nftables.Set) {
+				set.KeyType.Bytes++
+			},
+		},
+		{
+			name: "wrong data type",
+			mutate: func(set *nftables.Set) {
+				set.DataType = nftables.TypeInteger
+			},
+		},
+		{
+			name: "dynamic set",
+			mutate: func(set *nftables.Set) {
+				set.Dynamic = true
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := kernelNormalized
+			tt.mutate(&actual)
+			if containerAddressSetSchemaEqual(&actual, desired) {
+				t.Fatal("incompatible verdict map schema was accepted")
+			}
+		})
+	}
+}
+
 func TestMappedPortsOnNetworkWithoutGatewayStillCreateExternalRules(t *testing.T) {
 	rules, err := (&RuleManager{}).createPortMappingRules(
 		&setRecordingFirewall{},

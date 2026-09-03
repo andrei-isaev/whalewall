@@ -298,8 +298,15 @@ func containerAddressSetSchemaEqual(a, b *nftables.Set) bool {
 	if a == nil || b == nil || a.Table == nil || b.Table == nil {
 		return false
 	}
+	// Linux normalizes verdict-map data length to sizeof(struct nft_verdict)
+	// when it returns the set, while google/nftables.TypeVerdict uses Bytes=0
+	// when constructing it. The verdict nft magic is the semantic discriminator;
+	// continue to require the IPv4 key width and every safety-relevant set flag.
+	keyTypeEqual := a.KeyType.GetNFTMagic() == b.KeyType.GetNFTMagic() && a.KeyType.Bytes == b.KeyType.Bytes
+	dataTypeEqual := a.DataType.GetNFTMagic() == b.DataType.GetNFTMagic() &&
+		(b.DataType.GetNFTMagic() == nftables.TypeVerdict.GetNFTMagic() || a.DataType.Bytes == b.DataType.Bytes)
 	return a.Table.Name == b.Table.Name && a.Table.Family == b.Table.Family &&
-		a.IsMap == b.IsMap && a.KeyType == b.KeyType && a.DataType == b.DataType &&
+		a.IsMap == b.IsMap && keyTypeEqual && dataTypeEqual &&
 		a.Anonymous == b.Anonymous && a.Constant == b.Constant && a.Interval == b.Interval &&
 		!a.Dynamic && !b.Dynamic && !a.HasTimeout && !b.HasTimeout && !a.Concatenation && !b.Concatenation
 }
