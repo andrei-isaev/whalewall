@@ -57,7 +57,7 @@ func TestDestinationAvailabilityLifecycle(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				assertDestinationOrder(t, fw, "caddy", scopeSourceID, scopeDest1ID, scopeDest2ID, scopeDest3ID)
+				assertCaddyDestinationOrder(t, fw, scopeDest1ID, scopeDest2ID, scopeDest3ID)
 				var healthyRule *nftables.Rule
 				fw.readBaseFirewall(func(base *mockFirewall) {
 					healthyRule = base.chains[buildChainName("caddy", scopeSourceID)].Rules[0]
@@ -76,7 +76,7 @@ func TestDestinationAvailabilityLifecycle(t *testing.T) {
 				if err := r.createContainerRules(ctx, source, false); err != nil {
 					t.Fatal(err)
 				}
-				assertDestinationOrder(t, fw, "caddy", scopeSourceID, scopeDest1ID, scopeDest3ID)
+				assertCaddyDestinationOrder(t, fw, scopeDest1ID, scopeDest3ID)
 				fw.readBaseFirewall(func(base *mockFirewall) {
 					got := base.chains[buildChainName("caddy", scopeSourceID)].Rules[0]
 					if !rulesEqual(zap.NewNop(), healthyRule, got) {
@@ -90,7 +90,7 @@ func TestDestinationAvailabilityLifecycle(t *testing.T) {
 				if err := r.deleteContainerRules(ctx, backend.ID, "immich-server"); err != nil {
 					t.Fatal(err)
 				}
-				assertDestinationOrder(t, fw, "caddy", scopeSourceID, scopeDest1ID, scopeDest3ID)
+				assertCaddyDestinationOrder(t, fw, scopeDest1ID, scopeDest3ID)
 
 				// A replacement has a different Docker identity and IP. Recovery
 				// must bind the waiting edge to that identity, never the stale IP.
@@ -131,19 +131,19 @@ func TestDestinationAvailabilityLifecycle(t *testing.T) {
 				if err := r.createContainerRules(ctx, source, false); err != nil {
 					t.Fatal(err)
 				}
-				assertDestinationOrder(t, fw, "caddy", scopeSourceID, scopeDest1ID, backend.ID, scopeDest3ID)
+				assertCaddyDestinationOrder(t, fw, scopeDest1ID, backend.ID, scopeDest3ID)
 			})
 		}
 	}
 }
 
-func assertDestinationOrder(t *testing.T, fw mockFirewallCreatorI, name, sourceID string, want ...string) {
+func assertCaddyDestinationOrder(t *testing.T, fw mockFirewallCreatorI, want ...string) {
 	t.Helper()
 	fw.readBaseFirewall(func(base *mockFirewall) {
-		rules := base.chains[buildChainName(name, sourceID)].Rules
+		rules := base.chains[buildChainName("caddy", scopeSourceID)].Rules
 		var got []string
 		for _, rule := range rules {
-			if string(rule.UserData) != sourceID {
+			if string(rule.UserData) != scopeSourceID {
 				got = append(got, string(rule.UserData))
 				if !containsVerdict(rule.Exprs, expr.VerdictReturn) {
 					t.Fatal("destination rule is not an allow")
