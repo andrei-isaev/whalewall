@@ -213,7 +213,7 @@ func TestContainerListCreatesOrderedIndependentRules(t *testing.T) {
 	}
 }
 
-func TestUnresolvedContainerListEntryFailsCompletePolicy(t *testing.T) {
+func TestUnavailableContainerListEntryPreservesHealthyPolicy(t *testing.T) {
 	r, firewallCreator := newHardeningTestManager(t)
 	destination := scopedTestContainer(scopeDest1ID, "authelia", "172.30.0.3", "172.31.0.3", scopedEnabledLabels("authelia", "proxy"))
 	source := scopedTestContainer(scopeSourceID, "source", "172.30.0.2", "172.31.0.2", map[string]string{
@@ -233,32 +233,29 @@ func TestUnresolvedContainerListEntryFailsCompletePolicy(t *testing.T) {
 		t.Fatalf("create destination policy: %v", err)
 	}
 
-	err := r.createContainerRules(context.Background(), source, true)
-	if err == nil || !strings.Contains(err.Error(), `listed container "missing" could not be resolved`) {
-		t.Fatalf("createContainerRules() error = %v; want unresolved list-entry error", err)
+	if err := r.createContainerRules(context.Background(), source, true); err != nil {
+		t.Fatalf("createContainerRules() error = %v; unavailable destination must remain waiting", err)
 	}
-	assertDropOnlyChain(t, firewallCreator, buildChainName("source", scopeSourceID), scopeSourceID)
 	firewallCreator.readBaseFirewall(func(base *mockFirewall) {
-		destinationChain := base.chains[buildChainName("authelia", scopeDest1ID)]
-		for _, rule := range destinationChain.Rules {
-			if bytes.Equal(rule.UserData, []byte(scopeSourceID)) {
-				t.Fatalf("partial source rule was installed in destination chain: %#v", rule)
-			}
+		rules := base.chains[buildChainName("source", scopeSourceID)].Rules
+		if len(rules) != 2 || !bytes.Equal(rules[0].UserData, []byte(scopeDest1ID)) ||
+			!containsVerdict(rules[0].Exprs, expr.VerdictReturn) || !containsVerdict(rules[1].Exprs, expr.VerdictDrop) {
+			t.Fatalf("want healthy destination allow followed by default drop, got %#v", rules)
 		}
 	})
-	waiting, queryErr := r.db.GetWaitingContainerRules(context.Background(), "authelia")
+	waiting, queryErr := r.db.GetWaitingContainerRules(context.Background(), "missing")
 	if queryErr != nil {
 		t.Fatalf("GetWaitingContainerRules() error = %v", queryErr)
 	}
-	if len(waiting) != 0 {
-		t.Fatalf("failed list policy retained partial waiting rows: %#v", waiting)
+	if len(waiting) != 1 || waiting[0].SrcContainerID != scopeSourceID {
+		t.Fatalf("unavailable destination was not retained for recovery: %#v", waiting)
 	}
 	established, queryErr := r.db.GetEstContainers(context.Background(), scopeSourceID)
 	if queryErr != nil {
 		t.Fatalf("GetEstContainers() error = %v", queryErr)
 	}
-	if len(established) != 0 {
-		t.Fatalf("failed list policy retained partial established relationships: %#v", established)
+	if len(established) != 1 {
+		t.Fatalf("healthy destination relationship was lost: %#v", established)
 	}
 }
 

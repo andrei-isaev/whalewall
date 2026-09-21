@@ -29,7 +29,8 @@ services:
             dst_ports:
               - 443
           - network: default
-            container: server
+            # An unavailable backend must not quarantine client or block server.
+            containers: [server, absent-backend]
             proto: tcp
             dst_ports: 
               - 756

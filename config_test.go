@@ -299,34 +299,31 @@ func TestNormalizeConfigExpandsContainerListsInOrder(t *testing.T) {
 		Output: []ruleConfig{
 			input.Output[0],
 			{
-				LogPrefix:         "backend",
-				Network:           "proxy",
-				Container:         "authelia",
-				Proto:             tcp,
-				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
-				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
-				Verdict:           verdict{drop: true},
-				fromContainerList: true,
+				LogPrefix: "backend",
+				Network:   "proxy",
+				Container: "authelia",
+				Proto:     tcp,
+				SrcPorts:  []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:  []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:   verdict{drop: true},
 			},
 			{
-				LogPrefix:         "backend",
-				Network:           "proxy",
-				Container:         "jellyfin",
-				Proto:             tcp,
-				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
-				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
-				Verdict:           verdict{drop: true},
-				fromContainerList: true,
+				LogPrefix: "backend",
+				Network:   "proxy",
+				Container: "jellyfin",
+				Proto:     tcp,
+				SrcPorts:  []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:  []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:   verdict{drop: true},
 			},
 			{
-				LogPrefix:         "backend",
-				Network:           "proxy",
-				Container:         "homepage",
-				Proto:             tcp,
-				SrcPorts:          []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
-				DstPorts:          []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
-				Verdict:           verdict{drop: true},
-				fromContainerList: true,
+				LogPrefix: "backend",
+				Network:   "proxy",
+				Container: "homepage",
+				Proto:     tcp,
+				SrcPorts:  []rulePorts{{interval: portInterval{min: 30000, max: 30100}}},
+				DstPorts:  []rulePorts{{single: 443}, {interval: portInterval{min: 8000, max: 8010}}},
+				Verdict:   verdict{drop: true},
 			},
 			input.Output[2],
 		},
@@ -380,8 +377,8 @@ func TestContainerListYAMLDecodeAndNormalize(t *testing.T) {
 	}
 	for i, wantName := range []string{"authelia", "jellyfin", "homepage"} {
 		got := normalized.Output[i]
-		if got.Container != wantName || got.Containers != nil || !got.fromContainerList {
-			t.Fatalf("normalized output rule #%d = %#v; want singular list-origin rule for %q", i, got, wantName)
+		if got.Container != wantName || got.Containers != nil {
+			t.Fatalf("normalized output rule #%d = %#v; want singular rule for %q", i, got, wantName)
 		}
 	}
 }

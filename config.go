@@ -58,11 +58,10 @@ type ruleConfig struct {
 	NetworkID             string `yaml:"-"`
 	IdentityVersion       uint8  `yaml:"-"`
 
-	skip              bool
-	fromContainerList bool
-	containerSet      bool
-	containersSet     bool
-	ipsSet            bool
+	skip          bool
+	containerSet  bool
+	containersSet bool
+	ipsSet        bool
 }
 
 // UnmarshalYAML records selector-field presence so an explicitly empty
@@ -530,7 +529,6 @@ func normalizeConfig(c config) (config, error) {
 			expanded := rule
 			expanded.Container = container
 			expanded.Containers = nil
-			expanded.fromContainerList = true
 			expanded.containersSet = false
 			normalized = append(normalized, expanded)
 		}

@@ -261,8 +261,9 @@ Configuration is decoded strictly. In particular:
 - `container`, `containers`, and `ips` are mutually exclusive destination selectors. Empty
   selectors, blank container-list entries, and duplicate container-list entries are rejected.
 - An output rule's `network` must be managed by the source. Named destinations must also manage the
-  same concrete Docker network. Every member of a `containers` list is validated before any part of
-  that policy is installed.
+  same concrete Docker network. A missing or stopped destination contributes no allow rule until
+  it becomes available; other valid rules remain active. Invalid rules, ambiguous names, and running
+  destinations with invalid network scope still reject the complete source policy.
 - Use the current `src_ports` and `dst_ports` list fields. The old singular `port` field is rejected.
 - Ports and port-range endpoints must be between 1 and 65535; a range's start cannot exceed its end.
 - IP addresses, CIDRs, and ranges must be IPv4. IPv6 values are rejected rather than partially
@@ -362,8 +363,14 @@ output:
       - 8080
 ```
 
-Each list entry is resolved as an independent named-container rule, in the declared order, and one
-invalid or unresolved entry rejects the complete policy. Confirm
+Each list entry behaves like an independent `container` rule. An absent or stopped backend is kept
+as a waiting rule with no address-based permission, so it cannot quarantine Caddy or interrupt other
+backends. WhaleWall logs the deferred destination and retries through container events and periodic
+reconciliation. When it starts, its identity and shared managed network are validated before access
+is granted. Stopping or removing a backend removes its existing rules to prevent stale-IP access.
+A misspelled name also remains waiting: check the deferred-destination warnings. Invalid syntax,
+ambiguous identities, invalid scope, and Docker API failures still fail the complete policy closed.
+The declared list order is preserved when the source policy is rebuilt. Confirm
 `docker network inspect <actual-network-name> --format '{{.EnableIPv6}}'` prints `false`. Compose
 normally prefixes the network key with its project name. For hostile workloads, replace the shared
 `proxy` network with one bridge per Caddy-to-backend edge so unrelated services do not share a

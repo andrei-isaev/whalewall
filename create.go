@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/containerd/errdefs"
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/netlink"
@@ -764,9 +765,19 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 				if !ok {
 					inspected, inspectErr := r.dockerCli.ContainerInspect(ctx, listedCont.ID)
 					if inspectErr != nil {
+						if errdefs.IsNotFound(inspectErr) {
+							// The destination disappeared after the running-container
+							// snapshot. Treat this edge as waiting, not an invalid policy.
+							nameMatches--
+							continue
+						}
 						return fmt.Errorf("error inspecting container %s: %w", listedCont.ID[:12], inspectErr)
 					}
 					cont = inspected
+					if cont.State != nil && !cont.State.Running {
+						nameMatches--
+						continue
+					}
 					if cont.Config == nil {
 						return fmt.Errorf("output rule #%d: container %q has no configuration", i, ruleCfg.Container)
 					}
@@ -812,9 +823,6 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 			if len(candidates) == 0 && nameMatches != 0 {
 				return fmt.Errorf("output rule #%d: container %q does not share Docker network %q with the source container", i, ruleCfg.Container, ruleCfg.Network)
 			}
-			if len(candidates) == 0 && ruleCfg.fromContainerList {
-				return fmt.Errorf("output rule #%d: listed container %q could not be resolved", i, ruleCfg.Container)
-			}
 			if len(candidates) != 0 {
 				bestRank := slices.MaxFunc(candidates, func(a, b candidate) int { return cmp.Compare(a.rank, b.rank) }).rank
 				best := slices.DeleteFunc(candidates, func(c candidate) bool { return c.rank != bestRank })
@@ -841,10 +849,15 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 					cfg.Output[i].skip = true
 				}
 			} else {
-				// we need to add rules to this container's chain, but it
-				// hasn't been processed yet; wait until this container
-				// is processed to create the rules
+				// An absent or stopped destination contributes no allow rule.
+				// Keep the rest of the policy and persist this edge for recovery;
+				// never expand an unresolved name into a network-wide allow.
 				cfg.Output[i].skip = true
+				r.logger.Warn("destination unavailable, deferring output rule",
+					zap.String("source.container.id", id),
+					zap.String("destination.container", ruleCfg.Container),
+					zap.String("network", ruleCfg.Network),
+					zap.Int("output.rule", i))
 			}
 			// Add the rule to the database so when we are processing
 			// this container, this rule will be created. This is done
