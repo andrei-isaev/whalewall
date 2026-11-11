@@ -33,6 +33,7 @@ func (r *RuleManager) syncContainers(ctx context.Context, quarantineFirst bool) 
 	})
 
 	var syncErrs []error
+	var prepared []dockercontainer.InspectResponse
 	for _, c := range containers {
 		truncID := c.ID[:12]
 		container, err := r.dockerCli.ContainerInspect(ctx, c.ID)
@@ -64,7 +65,21 @@ func (r *RuleManager) syncContainers(ctx context.Context, quarantineFirst bool) 
 		// Always attempt authoritative enforcement. A database preflight can
 		// fail before the address is mapped to a drop chain and would leave an
 		// opted-in container open.
-		if err := r.createContainerRules(ctx, policyContainer, quarantineFirst); err != nil {
+		if err := r.reconcileContainerRules(ctx, policyContainer, quarantineFirst, true); err != nil {
+			syncErrs = append(syncErrs, fmt.Errorf("prepare container %s enforcement floor: %w", truncID, err))
+			continue
+		}
+		prepared = append(prepared, policyContainer)
+	}
+
+	// SQLite survives a reboot while nftables does not. Both resolved output
+	// rules and persisted waiting rules can reference peers in either order,
+	// so dependency sorting alone cannot make those chains safe to use.
+	for _, container := range prepared {
+		truncID := container.ID[:12]
+		// The first pass already quarantined startup policies. Repeating that
+		// here would discard rules installed by an earlier peer in this pass.
+		if err := r.createContainerRules(ctx, container, false); err != nil {
 			syncErrs = append(syncErrs, fmt.Errorf("secure container %s: %w", truncID, err))
 		}
 	}

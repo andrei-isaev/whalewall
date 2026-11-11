@@ -86,7 +86,13 @@ func (r *RuleManager) createRules(ctx context.Context) {
 }
 
 // createContainerRules creates nftables rules for a container.
-func (r *RuleManager) createContainerRules(ctx context.Context, container dockercontainer.InspectResponse, quarantineFirst bool) (retErr error) {
+func (r *RuleManager) createContainerRules(ctx context.Context, container dockercontainer.InspectResponse, quarantineFirst bool) error {
+	return r.reconcileContainerRules(ctx, container, quarantineFirst, false)
+}
+
+// floorOnly prepares a deny chain and its address mapping without resolving
+// peers. Bulk reconciliation prepares every peer before installing any allows.
+func (r *RuleManager) reconcileContainerRules(ctx context.Context, container dockercontainer.InspectResponse, quarantineFirst, floorOnly bool) (retErr error) {
 	ctx, cleanup := r.containerTracker.StartCreatingContainer(ctx, container.ID)
 	defer cleanup()
 
@@ -197,6 +203,9 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container docker
 	}
 	if networkPolicyErr != nil {
 		return fmt.Errorf("invalid managed network scope: %w", networkPolicyErr)
+	}
+	if floorOnly {
+		return ctx.Err()
 	}
 
 	// Parse configuration only after the enforcement floor is active. Invalid
@@ -1378,7 +1387,15 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		// find source container IP (not this container)
 		srcCont, err := r.dockerCli.ContainerInspect(ctx, waitingRule.SrcContainerID)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				// Docker removal can precede die-event database cleanup. An
+				// obsolete source must not quarantine a live destination.
+				continue
+			}
 			return nil, fmt.Errorf("error inspecting container %q: %w", waitingRule.Name, err)
+		}
+		if srcCont.State != nil && !srcCont.State.Running {
+			continue
 		}
 		if srcCont.Config == nil {
 			return nil, fmt.Errorf("source container %q has no configuration", waitingRule.Name)
